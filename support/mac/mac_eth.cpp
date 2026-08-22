@@ -98,25 +98,42 @@ static int dma_rpc(uint32_t gaddr, uint32_t len, int wr)
 	return -1;
 }
 
+// The guest-RAM DMA engine only moves 16-bit WORDS at EVEN addresses, but the
+// SONIC issues byte accesses at ARBITRARY addresses: an odd-length packet (e.g.
+// 101 bytes) leaves the next RX buffer pointer ODD, and a descriptor link value
+// carries the end-of-list flag in A0. On real hardware / MAME the 16-bit bus
+// handles this with byte enables; here the impedance match lives in these two
+// wrappers — word-align the transfer and copy the requested [ga, ga+len) slice
+// in/out of the (up to one byte larger) XFER window. Rejecting odd addresses
+// (the old behaviour) silently failed the RX buffer store, so PKTRX was never
+// raised and the guest driver hung at open time waiting for a looped-back frame.
 static int rpc_read(uint32_t ga, uint8_t *dst, uint32_t len)
 {
-	uint32_t n = (len + 1) & ~1u;   // engine wants even counts
-	if ((ga & 1) || n > 0xFFFE) return -1;
-	if (!n) return 0;
-	if (dma_rpc(ga, n, 0)) return -1;
-	memcpy(dst, (const void *)(win + ETH_OFF_XFER), len);
+	if (!len) return 0;
+	uint32_t a0  = ga & ~1u;              // word-aligned start
+	uint32_t off = ga - a0;               // 0 or 1
+	uint32_t n   = (off + len + 1) & ~1u; // even byte count spanning [ga, ga+len)
+	if (n > 0xFFFE) return -1;
+	if (dma_rpc(a0, n, 0)) return -1;
+	memcpy(dst, (const void *)(win + ETH_OFF_XFER + off), len);
 	return 0;
 }
 
 static int rpc_write(uint32_t ga, const uint8_t *src, uint32_t len)
 {
-	uint32_t n = (len + 1) & ~1u;
-	if ((ga & 1) || n > 0xFFFE) return -1;
-	if (!n) return 0;
-	memcpy((void *)(win + ETH_OFF_XFER), src, len);
-	if (n != len)   // odd length: pad the final word like real word DMA
-		win[ETH_OFF_XFER + len] = 0xFF;
-	return dma_rpc(ga, n, 1);
+	if (!len) return 0;
+	uint32_t a0  = ga & ~1u;
+	uint32_t off = ga - a0;
+	uint32_t n   = (off + len + 1) & ~1u;
+	if (n > 0xFFFE) return -1;
+	// Read-modify-write when either edge is unaligned, so the head byte (before
+	// an odd start) and the tail byte (after an odd end) that share a 16-bit
+	// word with the payload are preserved instead of being clobbered with pad.
+	if (off || (n != off + len)) {
+		if (dma_rpc(a0, n, 0)) return -1;   // prime XFER with the current words
+	}
+	memcpy((void *)(win + ETH_OFF_XFER + off), src, len);
+	return dma_rpc(a0, n, 1);
 }
 
 // grouped word accessors for the model: 68k big-endian values.

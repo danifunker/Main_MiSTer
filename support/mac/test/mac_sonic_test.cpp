@@ -15,9 +15,15 @@ static uint8_t ram[1 << 20];   // 1MB of fake guest RAM
 static uint8_t last_tx[2048];
 static int     last_tx_len;
 static int     tx_count;
+// The real DMA-RPC backend (mac_eth.cpp rpc_read/rpc_write) REQUIRES even
+// guest addresses and rejects odd ones. Model that here so the harness catches
+// the model handing a link value (EOL bit in LSB) to the word accessors as an
+// odd address — the boot-time wedge that a permissive `ram + ga` hid.
+static int     backend_odd;
 
 static int rd_words(uint32_t ga, uint16_t *w, int n, int stride)
 {
+	if (ga & 1) { backend_odd++; return -1; }
 	for (int i = 0; i < n; i++) {
 		const uint8_t *p = ram + ga + i * stride + (stride == 4 ? 2 : 0);
 		w[i] = (uint16_t)((p[0] << 8) | p[1]);
@@ -26,6 +32,7 @@ static int rd_words(uint32_t ga, uint16_t *w, int n, int stride)
 }
 static int wr_words(uint32_t ga, const uint16_t *w, int n, int stride)
 {
+	if (ga & 1) { backend_odd++; return -1; }
 	for (int i = 0; i < n; i++) {
 		uint8_t *p = ram + ga + i * stride + (stride == 4 ? 2 : 0);
 		p[0] = (uint8_t)(w[i] >> 8);
@@ -203,6 +210,37 @@ int main()
 	check(tx_count == 0, "loopback frame did not reach the wire");
 	check(sonic_reg(ISR) & 0x0400, "loopback frame received (PKTRX)");
 	check(rdw(0x43200 + 0) & 0x0002, "loopback RX status has LBK");
+
+	// ── dynamic TDA append: TXP with CTDA left at an ODD end-of-list link ──
+	// After a completed transmit the chip leaves CTDA holding the previous
+	// descriptor's link value WITH the EOL bit (LSB=1) set — an odd value.
+	// Re-issuing TXP without rewriting CTDA (the SONIC dynamic-append flow)
+	// must fetch the descriptor WORD-ALIGNED; the DMA-RPC backend rejects odd
+	// addresses, so without the word-align the fetch aborted transmit_chain and
+	// left CR.TXP set — the exact boot wedge seen on HW (the guest driver
+	// spin-polls TXP forever, one extension icon, boot never completes).
+	backend_odd = 0;
+	sonic_reg_write(UTDA, 0x0004);
+	sonic_reg_write(CTDA, 0x6001);         // odd EOL link -> descriptor at $6000 ($46000 on the bus)
+	wrw(0x46000 + 1 * 2, 0x0000);          // config
+	wrw(0x46000 + 2 * 2, TLEN);            // TPS
+	wrw(0x46000 + 3 * 2, 1);               // TFC
+	wrw(0x46000 + 4 * 2, 0x7000);          // TSA0
+	wrw(0x46000 + 5 * 2, 0x0004);          // TSA1 -> $47000
+	wrw(0x46000 + 6 * 2, TLEN);            // TFS
+	wrw(0x46000 + 7 * 2, 0x6001);          // link: EOL again (odd)
+	for (int i = 0; i < TLEN; i++) ram[0x47000 + i] = (uint8_t)(0xC0 + i);
+	sonic_reg_write(RCR, 0x0000);          // wire mode (clears the loopback LB bits)
+	tx_count = 0;
+	sonic_reg_write(ISR, 0x0200);          // clear any stale TXDN
+	sonic_reg_write(CR, 0x0002);           // TXP with CTDA odd
+	check(tx_count == 1, "odd-EOL CTDA: TXP transmitted (word-aligned fetch, no wedge)");
+	check(last_tx_len == TLEN + 4, "odd-EOL CTDA: FCS appended");
+	check(memcmp(last_tx, ram + 0x47000, TLEN) == 0, "odd-EOL CTDA: fragment gathered from $47000");
+	check(!(sonic_reg(CR) & 0x0002), "odd-EOL CTDA: CR.TXP self-cleared (releases the guest TXP-poll)");
+	check(sonic_reg(ISR) & 0x0200, "odd-EOL CTDA: ISR_TXDN set");
+	check(backend_odd == 0, "odd-EOL CTDA: no odd descriptor address reached the backend");
+	sonic_reg_write(ISR, 0x0200);
 
 	// ── ISR write-1-clear and IMR gating of the int line ─────────────
 	check(sonic_reg(ISR) & 0x0400, "ISR bit set before clear");

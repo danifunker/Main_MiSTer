@@ -93,6 +93,26 @@ static uint64_t cam[16];
 #define EA(hi, lo) ((uint32_t)((uint32_t)(hi) << 16 | (lo)))
 #define WIDTH()    ((reg[DCR] & DCR_DW) ? 4 : 2)
 
+// Descriptor (word) effective address. A link value's LSB is the END-OF-LIST
+// flag, NOT an address bit: the 16-bit SONIC bus has no A0, so a descriptor
+// pointer that still carries the EOL bit (e.g. CTDA left at an odd link after
+// a completed transmit) must be fetched WORD-ALIGNED. MAME reaches this via
+// address_space::read_word() (which drops A0); our DMA-RPC backend instead
+// REQUIRES even addresses and rejects odd ones, so an odd descriptor fetch
+// aborted transmit_chain mid-way and left CR.TXP set — a guest that spin-polls
+// TXP (or waits for TXDN) then hung forever at driver-open time. Mask A0 here
+// exactly where a link value is used as an address. (Byte/packet-buffer
+// pointers — CRBA, TSA — are NOT descriptor pointers and keep EA().)
+#define DA(hi, lo) (EA(hi, lo) & ~(uint32_t)1)
+
+// A host-op failure anywhere in the transmit chain must still release the
+// guest: leaving CR.TXP set wedges any driver that polls TXP or waits on the
+// TXDN interrupt. Mirror normal completion (clear TXP, raise TXDN) so a failed
+// transmit is a recoverable error, never a boot-time wedge. (With the DA()
+// word-align above, descriptor fetches no longer fail on the odd-EOL address;
+// this stays as a backstop for genuine out-of-range/host errors.)
+#define TX_ABORT() do { reg[CR] &= (uint16_t)~CR_TXP; reg[ISR] |= ISR_TXDN; return; } while (0)
+
 // ── ethernet CRC32 (reflected, poly 0xEDB88320), FCS byte order LE ──────
 static uint32_t crc32_eth(const uint8_t *p, int n)
 {
@@ -212,7 +232,7 @@ void sonic_rx_frame(const uint8_t *frame, int len)
 	// reload receive descriptor address after end-of-list
 	if (reg[CRDA] & 1) {
 		uint16_t v;
-		if (host->read_words(EA(reg[URDA], reg[LLFA]), &v, 1, WIDTH())) return;
+		if (host->read_words(DA(reg[URDA], reg[LLFA]), &v, 1, WIDTH())) return;
 		reg[CRDA] = v;
 		if (reg[CRDA] & 1) return;
 	}
@@ -254,7 +274,7 @@ void sonic_rx_frame(const uint8_t *frame, int len)
 
 	// write the 5-word RDA status, then the link handling
 	const int w = WIDTH();
-	uint32_t const rda = EA(reg[URDA], reg[CRDA]);
+	uint32_t const rda = DA(reg[URDA], reg[CRDA]);
 	uint16_t st[5] = { reg[RCR], (uint16_t)length, reg[TRBA0], reg[TRBA1], reg[RSC] };
 	if (host->write_words(rda, st, 5, w)) return;
 	reg[LLFA] = (uint16_t)(reg[CRDA] + 5 * w);
@@ -285,12 +305,12 @@ static void transmit_chain(void)
 	for (;;) {
 		const int w = WIDTH();
 		reg[TTDA] = reg[CTDA];
-		uint32_t const tda = EA(reg[UTDA], reg[CTDA]);
+		uint32_t const tda = DA(reg[UTDA], reg[CTDA]);
 		unsigned word = 1;   // word 0 is the status slot
 
 		uint16_t const tcr_old = reg[TCR];
 		uint16_t hdr[3];
-		if (host->read_words(tda + 1 * w, hdr, 3, w)) return;
+		if (host->read_words(tda + 1 * w, hdr, 3, w)) TX_ABORT();
 		reg[TCR] = hdr[0] & TCR_TPC;
 		reg[TPS] = hdr[1];
 		reg[TFC] = hdr[2];
@@ -304,14 +324,14 @@ static void transmit_chain(void)
 
 		for (unsigned frag = 0; frag < reg[TFC]; frag++) {
 			uint16_t fr[3];
-			if (host->read_words(tda + word * w, fr, 3, w)) return;
+			if (host->read_words(tda + word * w, fr, 3, w)) TX_ABORT();
 			reg[TSA0] = fr[0];
 			reg[TSA1] = fr[1];
 			reg[TFS]  = fr[2];
 			word += 3;
 
-			if (length + reg[TFS] > sizeof buf - 4) { reg[CR] &= (uint16_t)~CR_TXP; return; }
-			if (host->read_bytes(EA(reg[TSA1], reg[TSA0]), buf + length, reg[TFS])) return;
+			if (length + reg[TFS] > sizeof buf - 4) TX_ABORT();
+			if (host->read_bytes(EA(reg[TSA1], reg[TSA0]), buf + length, reg[TFS])) TX_ABORT();
 			length += reg[TFS];
 		}
 
@@ -339,7 +359,7 @@ static void transmit_chain(void)
 		// completion (MAME send_complete_cb, success path)
 		reg[TCR] |= TCR_PTX;
 		uint16_t st = reg[TCR] & TCR_TPS_;
-		if (host->write_words(EA(reg[UTDA], reg[TTDA]), &st, 1, w)) return;
+		if (host->write_words(DA(reg[UTDA], reg[TTDA]), &st, 1, w)) TX_ABORT();
 
 		if (reg[CR] & CR_HTX) {
 			reg[CR] &= (uint16_t)~CR_TXP;
@@ -347,7 +367,7 @@ static void transmit_chain(void)
 		}
 
 		uint16_t link;
-		if (host->read_words(EA(reg[UTDA], reg[CTDA]), &link, 1, w)) return;
+		if (host->read_words(DA(reg[UTDA], reg[CTDA]), &link, 1, w)) TX_ABORT();
 		reg[CTDA] = link;
 		if (reg[CTDA] & 1) {
 			reg[ISR] |= ISR_TXDN;
