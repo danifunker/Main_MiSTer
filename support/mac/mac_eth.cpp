@@ -47,6 +47,9 @@ static inline uint64_t now_us(void)
 static struct {
 	uint64_t rpc, rpc_slept, rpc_fail, rpc_us, rpc_us_max;
 	uint64_t rx_frames, rx_bytes, tx_frames, tx_bytes, drops, rx_refused;
+	uint64_t txp_cmds;          // CR writes carrying TXP (transmit asked for)
+	uint32_t ring_max, ring_ovf;// doorbell backlog watermark / overwrites
+	uint32_t reg_wr[64];        // what the driver actually writes
 } st;
 static uint8_t  guest_mac[6];
 static char     ifname[64] = "eth0";
@@ -306,6 +309,14 @@ static void drain_ring(void)
 		printf("mac_eth: wptr regressed (%u < %u) — FPGA reset, resync\n", wp, rptr);
 		rptr = 0;
 	}
+	uint32_t backlog = wp - rptr;
+	if (backlog > st.ring_max) st.ring_max = backlog;
+	if (backlog > ETH_RING_ENTRIES) {
+		// the FPGA lapped us: those slots hold newer entries now, and the
+		// register writes they carried are gone. Skip to what still exists.
+		st.ring_ovf += backlog - ETH_RING_ENTRIES;
+		rptr = wp - ETH_RING_ENTRIES;
+	}
 	int guard = ETH_RING_ENTRIES;
 	while (rptr != wp && guard--) {
 		uint64_t e = *w64(ETH_OFF_RING + 8 * (rptr & (ETH_RING_ENTRIES - 1)));
@@ -315,7 +326,11 @@ static void drain_ring(void)
 		int r    = (int)(e >> 4) & 0x3f;
 		int data = (int)(e >> 16) & 0xffff;
 		switch (tag) {
-		case ETH_TAG_REG_WR: sonic_reg_write(r, (uint16_t)data); break;
+		case ETH_TAG_REG_WR:
+			st.reg_wr[r & 0x3f]++;
+			if (r == SONIC_CR && (data & 0x0002)) st.txp_cmds++;   // CR_TXP
+			sonic_reg_write(r, (uint16_t)data);
+			break;
 		case ETH_TAG_RESET:  sonic_reset(); break;
 		}
 	}
@@ -471,6 +486,13 @@ void mac_eth_poll(void)
 			fprintf(f, "tx_bytes   %llu\n", (unsigned long long)st.tx_bytes);
 			fprintf(f, "sock_drops %llu\n", (unsigned long long)st.drops);
 			fprintf(f, "rx_refused %llu\n", (unsigned long long)st.rx_refused);
+			fprintf(f, "rpc_fail   %llu\n", (unsigned long long)st.rpc_fail);
+			fprintf(f, "txp_cmds   %llu\n", (unsigned long long)st.txp_cmds);
+			fprintf(f, "ring_max   %u  ring_ovf %u\n", st.ring_max, st.ring_ovf);
+			fprintf(f, "regwr");
+			for (int i = 0; i < 64; i++)
+				if (st.reg_wr[i]) fprintf(f, " %02X=%u", i, st.reg_wr[i]);
+			fprintf(f, "\n");
 			fprintf(f, "sonic cr=%04X isr=%04X imr=%04X crda=%04X rrp=%04X rwp=%04X\n",
 			        sonic_reg(SONIC_CR), sonic_reg(SONIC_ISR), sonic_reg(SONIC_IMR),
 			        sonic_reg(SONIC_CRDA), sonic_reg(SONIC_RRP), sonic_reg(SONIC_RWP));
