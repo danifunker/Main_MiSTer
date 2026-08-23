@@ -362,6 +362,11 @@ static void transmit_chain(void)
 		if (host->write_words(DA(reg[UTDA], reg[TTDA]), &st, 1, w)) TX_ABORT();
 
 		if (reg[CR] & CR_HTX) {
+			// Halt-transmit ends the chain, so it completes the transmit just
+			// as end-of-list does. Every other exit raises TXDN (normal
+			// completion and TX_ABORT both do); leaving it out here strands a
+			// driver that halts TX and then waits for the interrupt.
+			reg[ISR] |= ISR_TXDN;
 			reg[CR] &= (uint16_t)~CR_TXP;
 			return;
 		}
