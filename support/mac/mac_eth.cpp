@@ -46,7 +46,7 @@ static inline uint64_t now_us(void)
 // Counters only in the packet path; the file write happens on the 1 s tick.
 static struct {
 	uint64_t rpc, rpc_slept, rpc_fail, rpc_us, rpc_us_max;
-	uint64_t rx_frames, rx_bytes, tx_frames, tx_bytes, drops;
+	uint64_t rx_frames, rx_bytes, tx_frames, tx_bytes, drops, rx_refused;
 } st;
 static uint8_t  guest_mac[6];
 static char     ifname[64] = "eth0";
@@ -116,6 +116,16 @@ static void load_config(void)
 
 // ── DMA-RPC client (the SONIC model's guest-memory backend) ─────────────
 #define DMA_SPIN_US 1500   // busy-wait budget before falling back to usleep
+
+// SONIC register indices + bits we watch (values from mac_sonic.cpp).
+#define SONIC_CR        0x00
+#define SONIC_IMR       0x04
+#define SONIC_ISR       0x05
+#define SONIC_CRDA      0x0E
+#define SONIC_RRP       0x17
+#define SONIC_RWP       0x18
+#define SONIC_CR_RXEN   0x0008
+#define SONIC_ISR_RXEXH 0x0060   // RBE | RDE: reception halted until cleared
 static int dma_rpc(uint32_t gaddr, uint32_t len, int wr)
 {
 	if (!card_up) return -1;
@@ -435,6 +445,11 @@ void mac_eth_poll(void)
 		int n = mac_eth_iface_recv(frame, sizeof frame);
 		if (n <= 0) break;
 		st.rx_frames++; st.rx_bytes += n;
+		// The model silently refuses EVERY frame while RXEN is clear or
+		// RDE/RBE is latched - the "transfer just stopped" signature.
+		// Count those apart or the socket tally hides the stall.
+		if (!(sonic_reg(SONIC_CR) & SONIC_CR_RXEN) ||
+		    (sonic_reg(SONIC_ISR) & SONIC_ISR_RXEXH)) st.rx_refused++;
 		sonic_rx_frame(frame, n);
 	}
 
@@ -455,6 +470,10 @@ void mac_eth_poll(void)
 			fprintf(f, "tx_frames  %llu\n", (unsigned long long)st.tx_frames);
 			fprintf(f, "tx_bytes   %llu\n", (unsigned long long)st.tx_bytes);
 			fprintf(f, "sock_drops %llu\n", (unsigned long long)st.drops);
+			fprintf(f, "rx_refused %llu\n", (unsigned long long)st.rx_refused);
+			fprintf(f, "sonic cr=%04X isr=%04X imr=%04X crda=%04X rrp=%04X rwp=%04X\n",
+			        sonic_reg(SONIC_CR), sonic_reg(SONIC_ISR), sonic_reg(SONIC_IMR),
+			        sonic_reg(SONIC_CRDA), sonic_reg(SONIC_RRP), sonic_reg(SONIC_RWP));
 			fclose(f);
 		}
 	}
