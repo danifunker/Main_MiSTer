@@ -21,9 +21,19 @@ static int     tx_count;
 // odd address — the boot-time wedge that a permissive `ram + ga` hid.
 static int     backend_odd;
 
+// access log for descriptor-ordering assertions (RX publish-order test):
+// records every word-level host op while log_on is set.
+static struct { char kind; uint32_t ga; int n; } alog[64];
+static int alog_n, log_on;
+static void alog_push(char kind, uint32_t ga, int n)
+{
+	if (log_on && alog_n < 64) { alog[alog_n].kind = kind; alog[alog_n].ga = ga; alog[alog_n].n = n; alog_n++; }
+}
+
 static int rd_words(uint32_t ga, uint16_t *w, int n, int stride)
 {
 	if (ga & 1) { backend_odd++; return -1; }
+	alog_push('r', ga, n);
 	for (int i = 0; i < n; i++) {
 		const uint8_t *p = ram + ga + i * stride + (stride == 4 ? 2 : 0);
 		w[i] = (uint16_t)((p[0] << 8) | p[1]);
@@ -33,6 +43,7 @@ static int rd_words(uint32_t ga, uint16_t *w, int n, int stride)
 static int wr_words(uint32_t ga, const uint16_t *w, int n, int stride)
 {
 	if (ga & 1) { backend_odd++; return -1; }
+	alog_push('w', ga, n);
 	for (int i = 0; i < n; i++) {
 		uint8_t *p = ram + ga + i * stride + (stride == 4 ? 2 : 0);
 		p[0] = (uint8_t)(w[i] >> 8);
@@ -249,6 +260,41 @@ int main()
 	sonic_reg_write(ISR, 0x0400);
 	check(!(sonic_reg(ISR) & 0x0400), "ISR write-1-clear");
 	check(!sonic_int_line(), "int line low after the clear");
+
+	// ── RX descriptor publish order ──────────────────────────────────
+	// The status word at rda+0 is the driver publish flag: the Apple
+	// driver's ISR consumes and RECYCLES a descriptor (rewriting its link)
+	// the moment status goes nonzero, and each host op here is a ~100 us
+	// DMA-RPC on real hardware. So the status write must be the LAST
+	// descriptor access of the sequence - in particular AFTER the link
+	// read. Publishing first let the driver rewrite the link under our
+	// pending read: CRDA left the ring and the guest hard-froze in a
+	// link=0 self-orbit (HW post-mortem 2026-08-23).
+	sonic_reg_write(ISR, 0x0040);    // clear RDE left by the end-of-list test
+	sonic_reg_write(RCR, 0x2000);    // BRD back on (loopback test turned it off)
+	sonic_reg_write(CRDA, 0xA000);   // fresh descriptor at $4A000
+	wrw(0x4A00a, 0xA011);            // link: odd = end of list after one packet
+	wrw(0x4A00c, 0xffff);            // in-use
+	alog_n = 0; log_on = 1;
+	sonic_rx_frame(other, 60);       // broadcast frame from above
+	log_on = 0;
+	check(sonic_reg(ISR) & 0x0400, "publish-order: frame received");
+	{
+		int i_status = -1, i_link = -1, last_desc = -1;
+		for (int i = 0; i < alog_n; i++) {
+			if (alog[i].ga >= 0x4A000 && alog[i].ga < 0x4A00e) {
+				last_desc = i;
+				if (alog[i].kind == 'w' && alog[i].ga == 0x4A000 && alog[i].n == 1) i_status = i;
+				if (alog[i].kind == 'r' && alog[i].ga == 0x4A00a) i_link = i;
+			}
+		}
+		check(i_status >= 0, "publish-order: status written as its own 1-word op");
+		check(i_link >= 0, "publish-order: link read seen");
+		check(i_status > i_link, "publish-order: status write AFTER the link read");
+		check(i_status == last_desc, "publish-order: status is the LAST descriptor access");
+	}
+	check(rdw(0x4A000) & 0x0001, "publish-order: status has PRX");
+	check(sonic_reg(ISR) & 0x0040, "publish-order: odd link latched RDE");
 
 	printf(fails ? "%d FAILURES (mac_sonic_test)\n" : "ALL PASS (mac_sonic_test)\n", fails);
 	return fails != 0;

@@ -272,22 +272,34 @@ void sonic_rx_frame(const uint8_t *frame, int len)
 	reg[RBWC0] = (uint16_t)rbwc;
 	if (rbwc < reg[EOBC]) reg[RCR] |= RCR_LPKT;
 
-	// write the 5-word RDA status, then the link handling
+	// Write the RDA: body words FIRST, the status word LAST. The status word
+	// is the driver's publish flag - the Apple driver's ISR consumes a
+	// descriptor the instant status goes nonzero and RECYCLES it (rewriting
+	// link/in-use) within microseconds. On real silicon the chip's whole
+	// status/link/in-use sequence lands in ~us, long before driver code can
+	// run; here every transfer is a ~100 us DMA-RPC. The old order published
+	// status first and read the link LAST, so a spinning driver could rewrite
+	// the link while our read was in flight: CRDA left the ring (seen parked
+	// mid-buffer-area on HW), later 5-word writes clobbered driver RAM, and
+	// the driver ended in a link=0 self-orbit that hard-froze the guest
+	// (2026-08-23 post-mortem via the guest-RAM dump). Nothing may be written
+	// or read at this descriptor after its status is published.
 	const int w = WIDTH();
 	uint32_t const rda = DA(reg[URDA], reg[CRDA]);
 	uint16_t st[5] = { reg[RCR], (uint16_t)length, reg[TRBA0], reg[TRBA1], reg[RSC] };
-	if (host->write_words(rda, st, 5, w)) return;
+	if (host->write_words(rda + 1 * w, st + 1, 4, w)) return;   // count/ptrs/seq
 	reg[LLFA] = (uint16_t)(reg[CRDA] + 5 * w);
 	uint16_t link;
 	if (host->read_words(rda + 5 * w, &link, 1, w)) return;
+	if (!(link & 1)) {
+		uint16_t zero = 0;
+		host->write_words(rda + 6 * w, &zero, 1, w);   // clear in-use
+	}
+	if (host->write_words(rda, st, 1, w)) return;       // status: the publish
 	reg[CRDA] = link;
 
 	if (reg[CRDA] & 1)
 		reg[ISR] |= ISR_RDE;
-	else {
-		uint16_t zero = 0;
-		host->write_words(rda + 6 * w, &zero, 1, w);   // clear in-use
-	}
 
 	if (rbwc < reg[EOBC])
 		read_rra(0);
