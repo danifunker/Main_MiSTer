@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "../../user_io.h"
+#include "../../menu.h"
 #include "../../shmem.h"
 #include "../../hardware.h"
 #include "mac.h"
@@ -40,26 +41,48 @@ static volatile uint64_t *w64(uint32_t off)
 	return (volatile uint64_t *)(win + off);
 }
 
-// ── config: optional /media/fat/games/MacLC/eth.cfg ─────────────────────
-//   iface=tap0            (default eth0: raw+promisc on the shared NIC)
-//   mac=08:00:07:12:34:56 (default: Apple OUI + hostname hash)
+// ── OSD-selected settings ───────────────────────────────────────────────────
+// Interface and MAC suffix live in core status bits. The FPGA never reads
+// them - Main owns its own status word (the a2065 pattern) - and they
+// persist in the core's config slot like every other OSD option, so there
+// is nothing to save here.
+#define ETH_OPT_IFACE  "[37:36]"   // core: "o45,Net interface,eth0,tap0,macvlan,eth1"
+#define ETH_OPT_MACSUF "[35:32]"   // core: "o03,MAC suffix,0..F" (core status is
+                                   // [31:0]; these Main-only bits stay clear of it)
+
+static const char *const iface_names[4] = { "eth0", "tap0", "macvlan", "eth1" };
+
+// Fixed base: Apple's OUI + 'M' + a per-core byte, so a MacLC and a future
+// NuBus Mac core can never collide on one LAN. Only the last octet's low
+// nibble is user-selectable, and the first octet is always 0x08, so no OSD
+// selection can produce a multicast or locally-administered address.
+//
+// Deliberately NOT derived from anything on the box. The DE10-Nano has no
+// MAC EEPROM: u-boot gives every MiSTer the same eth0 address
+// (02:03:04:05:06:07) unless the owner wrote linux/u-boot.txt, and the
+// default hostname is "MiSTer" everywhere - both "unique" sources are
+// identical across stock boxes. A visible, stable, user-picked nibble beats
+// a derivation that silently collides.
+#define MAC_OUI_0   0x08
+#define MAC_OUI_1   0x00
+#define MAC_OUI_2   0x07
+#define MAC_FAMILY  0x4D           // 'M'
+#define MAC_CORE    0x4C           // 'L' - MacLC; give each Mac core its own
+
+// config: optional /media/fat/games/MacLC/eth.cfg, overriding the OSD for
+// what the OSD cannot express (an exact MAC, an iface outside the four).
+//   iface=tap0
+//   mac=08:00:07:12:34:56
 static void load_config(void)
 {
-	// default MAC: Apple OUI 08:00:07 + FNV hash of the hostname
-	char hn[128] = "mister";
-	FILE *f = fopen("/etc/hostname", "r");
-	if (f) {
-		if (fgets(hn, sizeof hn - 1, f)) hn[strcspn(hn, "\r\n")] = 0;
-		fclose(f);
-	}
-	uint32_t h = 2166136261u;
-	for (char *p = hn; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
-	guest_mac[0] = 0x08; guest_mac[1] = 0x00; guest_mac[2] = 0x07;
-	guest_mac[3] = (uint8_t)(h >> 16);
-	guest_mac[4] = (uint8_t)(h >> 8);
-	guest_mac[5] = (uint8_t)h;
+	guest_mac[0] = MAC_OUI_0; guest_mac[1] = MAC_OUI_1; guest_mac[2] = MAC_OUI_2;
+	guest_mac[3] = MAC_FAMILY; guest_mac[4] = MAC_CORE;
+	guest_mac[5] = (uint8_t)(user_io_status_get(ETH_OPT_MACSUF) & 0xF);
 
-	f = fopen("/media/fat/games/MacLC/eth.cfg", "r");
+	snprintf(ifname, sizeof ifname, "%s",
+	         iface_names[user_io_status_get(ETH_OPT_IFACE) & 3]);
+
+	FILE *f = fopen("/media/fat/games/MacLC/eth.cfg", "r");
 	if (!f) return;
 	char line[160];
 	while (fgets(line, sizeof line, f)) {
@@ -255,9 +278,33 @@ static void drain_ring(void)
 }
 
 // ── lifecycle ───────────────────────────────────────────────────────────
+// The OSD selections the running card was started with, so a mid-session
+// change can be detected and applied without a core reload.
+#define SEL_NONE 0xFFFFFFFFu
+static uint32_t sel_cur = SEL_NONE;
+static uint32_t fail_announced = SEL_NONE;
+
+static uint32_t sel_snapshot(void)
+{
+	return (user_io_status_get(ETH_OPT_IFACE) & 3) |
+	       ((user_io_status_get(ETH_OPT_MACSUF) & 0xF) << 8);
+}
+
+static void announce_up(void)
+{
+	char msg[96];
+	snprintf(msg, sizeof msg,
+	         "Ethernet: %s\n%02X:%02X:%02X:%02X:%02X:%02X\n"
+	         "restart the Mac to apply",
+	         ifname, guest_mac[0], guest_mac[1], guest_mac[2],
+	         guest_mac[3], guest_mac[4], guest_mac[5]);
+	Info(msg, 3000);
+}
+
 static void card_start(void)
 {
 	load_config();
+	sel_cur = sel_snapshot();
 	sonic_init(&host_ops);
 
 	rptr = (uint32_t)*w64(ETH_OFF_WPTR);   // skip anything stale
@@ -268,7 +315,20 @@ static void card_start(void)
 
 	stage_declrom();
 	stage_macprom();
-	if (!mac_eth_iface_open(ifname)) return;
+	if (!mac_eth_iface_open(ifname)) {
+		// A selection this box cannot serve (no tun for tap0, no second NIC)
+		// leaves the guest cardless; say so once, or it reads as "ethernet is
+		// broken". card_start() retries each second, hence the latch.
+		if (fail_announced != sel_cur) {
+			fail_announced = sel_cur;
+			char msg[64];
+			snprintf(msg, sizeof msg, "Ethernet: %s unavailable", ifname);
+			Info(msg, 4000);
+			printf("mac_eth: iface %s unavailable - card stays down\n", ifname);
+		}
+		return;
+	}
+	fail_announced = SEL_NONE;
 	push_state();
 	*w64(ETH_OFF_GEO) = 2;                 // layout version
 	__sync_synchronize();
@@ -316,6 +376,15 @@ void mac_eth_poll(void)
 			if (mapped) card_start();
 		}
 		else if (!want && card_up) card_stop();
+		else if (want && card_up && sel_snapshot() != sel_cur) {
+			// OSD selection changed: restart onto the new iface/MAC. The FPGA
+			// latched presence at guest reset, so the guest keeps its card - a
+			// changed MAC only reaches its driver on the next guest restart,
+			// which announce_up() says out loud.
+			card_stop();
+			card_start();
+			if (card_up) announce_up();
+		}
 	}
 
 	if (!card_up) return;
