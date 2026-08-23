@@ -49,5 +49,6 @@ void mac_eth_iface_close(void);
 int  mac_eth_iface_send(const uint8_t *frame, int len);
 int  mac_eth_iface_recv(uint8_t *buf, int maxlen);
 int  mac_eth_iface_fd(void);
+int  mac_eth_iface_drops(void);
 
 #endif

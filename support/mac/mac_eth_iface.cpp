@@ -96,6 +96,12 @@ static int open_raw(const char *name)
 	memset(&mreq, 0, sizeof mreq);
 	mreq.mr_ifindex = ifindex;
 	mreq.mr_type    = PACKET_MR_PROMISC;
+	// Absorb bursts: the service drains on a ~1 ms poll tick, so the default
+	// (~160 KB) buffer overflows if a pass runs long. Dropped frames cost far
+	// more than the memory - TCP reacts to loss by collapsing its window.
+	int rcvbuf = 1 << 20;
+	setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+
 	if (setsockopt(sock_fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof mreq) < 0)
 		printf("mac_eth: promisc membership on %s failed\n", name);
 
@@ -131,4 +137,15 @@ int mac_eth_iface_recv(uint8_t *buf, int maxlen)
 	int n = read(sock_fd, buf, maxlen);
 	if (n < 0) return -1;   // EAGAIN: nothing pending
 	return n;
+}
+
+// Kernel-side drop count for this socket since the previous call (reading
+// PACKET_STATISTICS resets it). Frames the kernel had nowhere to put.
+int mac_eth_iface_drops(void)
+{
+	if (sock_fd < 0) return 0;
+	struct tpacket_stats ps;
+	socklen_t len = sizeof ps;
+	if (getsockopt(sock_fd, SOL_PACKET, PACKET_STATISTICS, &ps, &len) < 0) return 0;
+	return (int)ps.tp_drops;
 }

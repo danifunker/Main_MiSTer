@@ -19,6 +19,7 @@
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "../../user_io.h"
 #include "../../menu.h"
@@ -33,6 +34,20 @@ static volatile uint8_t *win;   // the mapped DDR3 window
 static int      card_up;
 static uint32_t rptr;
 static uint8_t  dma_seq;
+
+static inline uint64_t now_us(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000ull + ts.tv_nsec / 1000;
+}
+
+// Throughput instrumentation, dumped to /tmp/mac_eth_stats once a second.
+// Counters only in the packet path; the file write happens on the 1 s tick.
+static struct {
+	uint64_t rpc, rpc_slept, rpc_fail, rpc_us, rpc_us_max;
+	uint64_t rx_frames, rx_bytes, tx_frames, tx_bytes, drops;
+} st;
 static uint8_t  guest_mac[6];
 static char     ifname[64] = "eth0";
 
@@ -100,6 +115,7 @@ static void load_config(void)
 }
 
 // ── DMA-RPC client (the SONIC model's guest-memory backend) ─────────────
+#define DMA_SPIN_US 1500   // busy-wait budget before falling back to usleep
 static int dma_rpc(uint32_t gaddr, uint32_t len, int wr)
 {
 	if (!card_up) return -1;
@@ -109,16 +125,31 @@ static int dma_rpc(uint32_t gaddr, uint32_t len, int wr)
 	                     | ((uint64_t)(wr ? 1 : 0) << 8) | dma_seq;
 	__sync_synchronize();
 
-	// typical completion is tens of microseconds; 50 ms = FPGA gone
-	for (int spin = 0; spin < 1000; spin++) {
-		uint64_t st = *w64(ETH_OFF_DMASTAT);
-		if ((st & 0xff) == dma_seq)
-			return (st & 0x100) ? -1 : 0;
-		usleep(50);
+	// The FPGA answers in ~32 us hot / ~660 us cold, but usleep(50) does not
+	// sleep 50 us - it costs a scheduler round trip (~1 ms here). Sleeping
+	// FIRST therefore turned every RPC into a millisecond, and at 5 RPCs per
+	// received frame that starved the RX pump until the socket buffer
+	// overflowed and TCP collapsed to retransmit timeouts. Spin on the
+	// uncached mailbox word for the window the FPGA actually needs, and only
+	// then fall back to sleeping for the pathological tail.
+	uint64_t t0 = now_us(), el = 0;
+	int rc = -1, slept = 0;
+	for (;;) {
+		uint64_t s = *w64(ETH_OFF_DMASTAT);
+		if ((s & 0xff) == dma_seq) { rc = (s & 0x100) ? -1 : 0; break; }
+		el = now_us() - t0;
+		if (el > 50000) {              // 50 ms = FPGA gone
+			printf("mac_eth: DMA-RPC timeout (seq %u addr 0x%x len %u)\n",
+			       dma_seq, gaddr, len);
+			break;
+		}
+		if (el > DMA_SPIN_US) { usleep(50); slept = 1; }
 	}
-	printf("mac_eth: DMA-RPC timeout (seq %u addr 0x%x len %u)\n",
-	       dma_seq, gaddr, len);
-	return -1;
+	el = now_us() - t0;
+	st.rpc++; st.rpc_us += el; if (slept) st.rpc_slept++;
+	if (rc) st.rpc_fail++;
+	if (el > st.rpc_us_max) st.rpc_us_max = el;
+	return rc;
 }
 
 // The guest-RAM DMA engine only moves 16-bit WORDS at EVEN addresses, but the
@@ -190,7 +221,11 @@ static int gw_write_words(uint32_t ga, const uint16_t *v, int n, int stride)
 
 static int gb_read(uint32_t ga, uint8_t *b, int n)  { return rpc_read(ga, b, (uint32_t)n); }
 static int gb_write(uint32_t ga, const uint8_t *b, int n) { return rpc_write(ga, b, (uint32_t)n); }
-static int wire_send(const uint8_t *f, int n) { return mac_eth_iface_send(f, n); }
+static int wire_send(const uint8_t *f, int n)
+{
+	st.tx_frames++; st.tx_bytes += n;
+	return mac_eth_iface_send(f, n);
+}
 
 static const sonic_host_ops host_ops = {
 	gw_read_words, gw_write_words, gb_read, gb_write, wire_send
@@ -358,7 +393,7 @@ static int core_is_maclc(void)
 
 void mac_eth_poll(void)
 {
-	static unsigned long pace_timer, name_timer;
+	static unsigned long pace_timer, name_timer, stats_timer;
 	static int mapped;
 
 	// ~1 ms service pace; core-name recheck each second
@@ -391,13 +426,36 @@ void mac_eth_poll(void)
 
 	drain_ring();
 
-	// bounded receive pump: the model filters and DMAs into guest RAM
+	// Bounded receive pump: the model filters and DMAs into guest RAM. Bound
+	// by TIME, not a frame count - a fixed count starves the drain when RPCs
+	// run slow and needlessly caps it when they run fast.
 	uint8_t frame[2048];
-	for (int i = 0; i < 4; i++) {
+	uint64_t rx_t0 = now_us();
+	while (now_us() - rx_t0 < 1000) {
 		int n = mac_eth_iface_recv(frame, sizeof frame);
 		if (n <= 0) break;
+		st.rx_frames++; st.rx_bytes += n;
 		sonic_rx_frame(frame, n);
 	}
 
 	push_state();
+
+	if (CheckTimer(stats_timer)) {
+		stats_timer = GetTimer(1000);
+		st.drops += (uint64_t)mac_eth_iface_drops();
+		FILE *f = fopen("/tmp/mac_eth_stats", "w");
+		if (f) {
+			fprintf(f, "rpc        %llu\n", (unsigned long long)st.rpc);
+			fprintf(f, "rpc_slept  %llu\n", (unsigned long long)st.rpc_slept);
+			fprintf(f, "rpc_us_avg %llu\n",
+			        (unsigned long long)(st.rpc ? st.rpc_us / st.rpc : 0));
+			fprintf(f, "rpc_us_max %llu\n", (unsigned long long)st.rpc_us_max);
+			fprintf(f, "rx_frames  %llu\n", (unsigned long long)st.rx_frames);
+			fprintf(f, "rx_bytes   %llu\n", (unsigned long long)st.rx_bytes);
+			fprintf(f, "tx_frames  %llu\n", (unsigned long long)st.tx_frames);
+			fprintf(f, "tx_bytes   %llu\n", (unsigned long long)st.tx_bytes);
+			fprintf(f, "sock_drops %llu\n", (unsigned long long)st.drops);
+			fclose(f);
+		}
+	}
 }
