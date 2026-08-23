@@ -50,6 +50,8 @@ static struct {
 	uint64_t txp_cmds;          // CR writes carrying TXP (transmit asked for)
 	uint32_t ring_max, ring_ovf;// doorbell backlog watermark / overwrites
 	uint32_t reg_wr[64];        // what the driver actually writes
+	uint64_t tx_fail;           // wire_send failures (were silently ignored)
+	uint64_t rx_ours, rx_ours_bytes;  // frames actually addressed to the guest
 } st;
 static uint8_t  guest_mac[6];
 static char     ifname[64] = "eth0";
@@ -237,7 +239,11 @@ static int gb_write(uint32_t ga, const uint8_t *b, int n) { return rpc_write(ga,
 static int wire_send(const uint8_t *f, int n)
 {
 	st.tx_frames++; st.tx_bytes += n;
-	return mac_eth_iface_send(f, n);
+	int rc = mac_eth_iface_send(f, n);
+	// a short/failed write means the frame never reached the wire; the
+	// return value used to be discarded, so that looked like a sent frame
+	if (rc != n) st.tx_fail++;
+	return rc;
 }
 
 static const sonic_host_ops host_ops = {
@@ -460,6 +466,12 @@ void mac_eth_poll(void)
 		int n = mac_eth_iface_recv(frame, sizeof frame);
 		if (n <= 0) break;
 		st.rx_frames++; st.rx_bytes += n;
+		// eth0 is promiscuous, so rx_frames counts ALL LAN traffic -
+		// including our own ssh. Count what is actually addressed to the
+		// guest separately or the totals flatter the transfer.
+		if ((frame[0] & 1) || !memcmp(frame, guest_mac, 6)) {
+			st.rx_ours++; st.rx_ours_bytes += n;
+		}
 		// The model silently refuses EVERY frame while RXEN is clear or
 		// RDE/RBE is latched - the "transfer just stopped" signature.
 		// Count those apart or the socket tally hides the stall.
@@ -488,6 +500,9 @@ void mac_eth_poll(void)
 			fprintf(f, "rx_refused %llu\n", (unsigned long long)st.rx_refused);
 			fprintf(f, "rpc_fail   %llu\n", (unsigned long long)st.rpc_fail);
 			fprintf(f, "txp_cmds   %llu\n", (unsigned long long)st.txp_cmds);
+			fprintf(f, "tx_fail    %llu\n", (unsigned long long)st.tx_fail);
+			fprintf(f, "rx_ours    %llu  bytes %llu\n",
+			        (unsigned long long)st.rx_ours, (unsigned long long)st.rx_ours_bytes);
 			fprintf(f, "ring_max   %u  ring_ovf %u\n", st.ring_max, st.ring_ovf);
 			fprintf(f, "regwr");
 			for (int i = 0; i < 64; i++)
