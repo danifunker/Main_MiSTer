@@ -52,6 +52,8 @@ static struct {
 	uint32_t reg_wr[64];        // what the driver actually writes
 	uint64_t tx_fail;           // wire_send failures (were silently ignored)
 	uint64_t rx_ours, rx_ours_bytes;  // frames actually addressed to the guest
+	uint64_t rx_arp, tx_arp;    // ethertype 0x0806 each way
+	uint64_t rx_ip,  tx_ip;     // ethertype 0x0800 each way
 } st;
 static uint8_t  guest_mac[6];
 static char     ifname[64] = "eth0";
@@ -239,6 +241,11 @@ static int gb_write(uint32_t ga, const uint8_t *b, int n) { return rpc_write(ga,
 static int wire_send(const uint8_t *f, int n)
 {
 	st.tx_frames++; st.tx_bytes += n;
+	if (n >= 14) {
+		unsigned et = ((unsigned)f[12] << 8) | f[13];
+		if (et == 0x0806) st.tx_arp++;
+		else if (et == 0x0800) st.tx_ip++;
+	}
 	int rc = mac_eth_iface_send(f, n);
 	// a short/failed write means the frame never reached the wire; the
 	// return value used to be discarded, so that looked like a sent frame
@@ -471,6 +478,11 @@ void mac_eth_poll(void)
 		// guest separately or the totals flatter the transfer.
 		if ((frame[0] & 1) || !memcmp(frame, guest_mac, 6)) {
 			st.rx_ours++; st.rx_ours_bytes += n;
+			if (n >= 14) {
+				unsigned et = ((unsigned)frame[12] << 8) | frame[13];
+				if (et == 0x0806) st.rx_arp++;
+				else if (et == 0x0800) st.rx_ip++;
+			}
 		}
 		// The model silently refuses EVERY frame while RXEN is clear or
 		// RDE/RBE is latched - the "transfer just stopped" signature.
@@ -503,6 +515,10 @@ void mac_eth_poll(void)
 			fprintf(f, "tx_fail    %llu\n", (unsigned long long)st.tx_fail);
 			fprintf(f, "rx_ours    %llu  bytes %llu\n",
 			        (unsigned long long)st.rx_ours, (unsigned long long)st.rx_ours_bytes);
+			fprintf(f, "arp        rx %llu  tx %llu\n",
+			        (unsigned long long)st.rx_arp, (unsigned long long)st.tx_arp);
+			fprintf(f, "ip         rx %llu  tx %llu\n",
+			        (unsigned long long)st.rx_ip, (unsigned long long)st.tx_ip);
 			fprintf(f, "ring_max   %u  ring_ovf %u\n", st.ring_max, st.ring_ovf);
 			fprintf(f, "regwr");
 			for (int i = 0; i < 64; i++)
