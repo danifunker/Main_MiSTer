@@ -1113,7 +1113,26 @@ static void send_rtc(int type)
 
 	if (type & 2)
 	{
-		t += t - mktime(gmtime(&t));
+		// UTC -> local epoch. The stock idiom (else-branch) feeds mktime() a
+		// gmtime() result whose tm_isdst is 0, so the STANDARD-time offset
+		// applies year-round and every TIMESTAMP consumer runs an hour behind
+		// during DST. Scoped per user request (2026-08-23): the Mac cores get
+		// a DST-aware conversion (the guest RTC displays this value directly
+		// as wall-clock time); every other core keeps the legacy behavior.
+		// Prefix match covers MacLC and MacLCII (both Macs) - unlike the
+		// ethernet layer's exact match, which must exclude MacLCII.
+		if (!strncasecmp(user_io_get_core_name(0), "maclc", 5) ||
+		    !strncasecmp(user_io_get_core_name(1), "maclc", 5))
+		{
+			struct tm tm_utc;
+			gmtime_r(&t, &tm_utc);
+			tm_utc.tm_isdst = -1;   // let mktime resolve DST for this date
+			t += t - mktime(&tm_utc);
+		}
+		else
+		{
+			t += t - mktime(gmtime(&t));
+		}
 
 		spi_uio_cmd_cont(UIO_TIMESTAMP);
 		spi_w(t);
