@@ -138,6 +138,13 @@ static int dma_rpc(uint32_t gaddr, uint32_t len, int wr)
 	if (!card_up) return -1;
 	if (++dma_seq == 0) dma_seq = 1;   // 0 = the engine's reset state
 
+	// The command word's addr field is bits [39:16] — 24 bits, the LC PDS's
+	// physical reach. A caller-supplied top byte would land in the COUNT
+	// field (bits 47:40) and turn a 64-byte read into a ~33 KB grind (the
+	// 50 ms rpc_us_max timeouts). The SONIC model masks at EA(); enforce the
+	// encoding here too so no future caller can corrupt the count.
+	gaddr &= 0x00ffffffu;
+
 	*w64(ETH_OFF_DMACMD) = ((uint64_t)len << 40) | ((uint64_t)gaddr << 16)
 	                     | ((uint64_t)(wr ? 1 : 0) << 8) | dma_seq;
 	__sync_synchronize();
@@ -513,6 +520,7 @@ void mac_eth_poll(void)
 			fprintf(f, "rpc_fail   %llu\n", (unsigned long long)st.rpc_fail);
 			fprintf(f, "txp_cmds   %llu\n", (unsigned long long)st.txp_cmds);
 			fprintf(f, "tx_fail    %llu\n", (unsigned long long)st.tx_fail);
+			fprintf(f, "ea_strip   %u\n", sonic_ea_stripped());
 			fprintf(f, "rx_ours    %llu  bytes %llu\n",
 			        (unsigned long long)st.rx_ours, (unsigned long long)st.rx_ours_bytes);
 			fprintf(f, "arp        rx %llu  tx %llu\n",

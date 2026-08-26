@@ -90,8 +90,31 @@ static const sonic_host_ops *host;
 static uint16_t reg[64];
 static uint64_t cam[16];
 
-#define EA(hi, lo) ((uint32_t)((uint32_t)(hi) << 16 | (lo)))
+// Bus effective address. The LC PDS exposes 24 address lines, so the real
+// card's DMA only ever drives A0-A23: whatever the driver leaves in the top
+// byte of a pointer never reaches memory. That byte is NOT always zero — a
+// 24-bit-mode System stores Memory Manager flags there (bit 31 = locked, and
+// a DMA buffer is locked while pinned), so TX fragment pointers arrive as
+// $80xxxxxx while ARP frames — sent from driver-owned NewPtr buffers with a
+// clean top byte — pass. Reading those raw sent the RPC outside guest RAM
+// (and the dirty byte into the mailbox COUNT field, bits 47:40 vs the 24-bit
+// addr field 39:16), so every multi-fragment (IP) transmit aborted silently:
+// the exact HW fingerprint "arp tx 33, ip tx 0". Mask to the slot's physical
+// 24 bits, exactly like the hardware; ea_stripped counts the dirty ones as a
+// witness (surfaced in /tmp/mac_eth_stats). Register ARITHMETIC (e.g. the
+// CRBA advance) must use the raw 32-bit combine so guest-visible register
+// values keep their top byte like real silicon — mask only at the bus.
+static uint32_t ea_stripped_cnt;
+static inline uint32_t ea24(uint32_t hi, uint32_t lo)
+{
+	uint32_t a = (hi << 16) | lo;
+	if (a >> 24) ea_stripped_cnt++;
+	return a & 0x00ffffffu;
+}
+#define EA(hi, lo) ea24((uint16_t)(hi), (uint16_t)(lo))
 #define WIDTH()    ((reg[DCR] & DCR_DW) ? 4 : 2)
+
+uint32_t sonic_ea_stripped(void) { return ea_stripped_cnt; }
 
 // Descriptor (word) effective address. A link value's LSB is the END-OF-LIST
 // flag, NOT an address bit: the 16-bit SONIC bus has no A0, so a descriptor
@@ -260,10 +283,12 @@ void sonic_rx_frame(const uint8_t *frame, int len)
 	reg[TBWC1] = reg[RBWC1];
 
 	// store packet to the rba FIRST (write order is driver-visible)
-	uint32_t const rba = EA(reg[CRBA1], reg[CRBA0]);
-	if (host->write_bytes(rba, buf, length)) return;
+	// (advance the CRBA register from the RAW 32-bit value — real silicon
+	// keeps the top byte the driver wrote; only the bus address is 24-bit)
+	uint32_t const rba_reg = ((uint32_t)reg[CRBA1] << 16) | reg[CRBA0];
+	if (host->write_bytes(EA(reg[CRBA1], reg[CRBA0]), buf, length)) return;
 
-	uint32_t const crba = rba + length;
+	uint32_t const crba = rba_reg + length;
 	reg[CRBA1] = (uint16_t)(crba >> 16);
 	reg[CRBA0] = (uint16_t)crba;
 

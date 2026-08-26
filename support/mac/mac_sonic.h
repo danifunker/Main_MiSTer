@@ -31,5 +31,6 @@ uint16_t sonic_reg(int reg);                   // current value (shadow source)
 void     sonic_fill_shadows(uint16_t regs[64]);
 int      sonic_int_line(void);                 // level: ISR & IMR & 0x7fff
 void     sonic_rx_frame(const uint8_t *frame, int len);  // frame WITHOUT FCS
+uint32_t sonic_ea_stripped(void);              // dirty-top-byte addrs masked (24-bit-mode witness)
 
 #endif

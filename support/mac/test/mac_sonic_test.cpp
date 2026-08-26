@@ -20,6 +20,11 @@ static int     tx_count;
 // the model handing a link value (EOL bit in LSB) to the word accessors as an
 // odd address — the boot-time wedge that a permissive `ram + ga` hid.
 static int     backend_odd;
+// Any address beyond the fake RAM is a model bug (e.g. a 24-bit-mode pointer
+// whose Memory-Manager flag byte was not masked): count it and fail the op
+// instead of stomping host memory.
+static int     backend_oob;
+static int oob(uint32_t ga, uint32_t n) { if (ga + n > sizeof ram) { backend_oob++; return 1; } return 0; }
 
 // access log for descriptor-ordering assertions (RX publish-order test):
 // records every word-level host op while log_on is set.
@@ -33,6 +38,7 @@ static void alog_push(char kind, uint32_t ga, int n)
 static int rd_words(uint32_t ga, uint16_t *w, int n, int stride)
 {
 	if (ga & 1) { backend_odd++; return -1; }
+	if (oob(ga, (uint32_t)n * stride)) return -1;
 	alog_push('r', ga, n);
 	for (int i = 0; i < n; i++) {
 		const uint8_t *p = ram + ga + i * stride + (stride == 4 ? 2 : 0);
@@ -43,6 +49,7 @@ static int rd_words(uint32_t ga, uint16_t *w, int n, int stride)
 static int wr_words(uint32_t ga, const uint16_t *w, int n, int stride)
 {
 	if (ga & 1) { backend_odd++; return -1; }
+	if (oob(ga, (uint32_t)n * stride)) return -1;
 	alog_push('w', ga, n);
 	for (int i = 0; i < n; i++) {
 		uint8_t *p = ram + ga + i * stride + (stride == 4 ? 2 : 0);
@@ -51,8 +58,8 @@ static int wr_words(uint32_t ga, const uint16_t *w, int n, int stride)
 	}
 	return 0;
 }
-static int rd_bytes(uint32_t ga, uint8_t *b, int n)  { memcpy(b, ram + ga, n); return 0; }
-static int wr_bytes(uint32_t ga, const uint8_t *b, int n) { memcpy(ram + ga, b, n); return 0; }
+static int rd_bytes(uint32_t ga, uint8_t *b, int n)  { if (oob(ga, (uint32_t)n)) return -1; memcpy(b, ram + ga, n); return 0; }
+static int wr_bytes(uint32_t ga, const uint8_t *b, int n) { if (oob(ga, (uint32_t)n)) return -1; memcpy(ram + ga, b, n); return 0; }
 static int tx(const uint8_t *f, int n)
 {
 	memcpy(last_tx, f, n);
@@ -295,6 +302,64 @@ int main()
 	}
 	check(rdw(0x4A000) & 0x0001, "publish-order: status has PRX");
 	check(sonic_reg(ISR) & 0x0040, "publish-order: odd link latched RDE");
+
+	// ── 24-bit-mode dirty pointers: the top byte is MM flags, not address ──
+	// A fresh System 7 runs 24-bit addressing, where a pointer's top byte
+	// carries Memory Manager flags (bit 31 = locked — and a DMA buffer IS
+	// locked). The LC PDS has 24 address lines, so the real card never sees
+	// that byte; the model must mask it at the bus or every multi-fragment
+	// (IP/TCP) transmit aborts silently while single-fragment ARP — sent from
+	// clean driver-owned NewPtr buffers — passes. That asymmetry (arp tx 33,
+	// ip tx 0) was the exact 2026-08-26 HW fingerprint on a fresh 7.5.5.
+	uint32_t eas0 = sonic_ea_stripped();
+	backend_oob = 0;
+	sonic_reg_write(ISR, 0x0640);          // clear TXDN + PKTRX + RDE
+	sonic_reg_write(UTDA, 0x8004);         // dirty upper half: locked flag set
+	sonic_reg_write(CTDA, 0x8000);         // descriptor true address $48000
+	wrw(0x48000 + 1 * 2, 0x0000);          // config
+	wrw(0x48000 + 2 * 2, 114);             // TPS: 14 hdr + 100 payload
+	wrw(0x48000 + 3 * 2, 2);               // TFC = 2: the IP shape
+	wrw(0x48000 + 4 * 2, 0x8100);          // frag 1 TSA0 (driver header, clean)
+	wrw(0x48000 + 5 * 2, 0x0004);          // frag 1 TSA1 -> $48100
+	wrw(0x48000 + 6 * 2, 14);              // frag 1 TFS
+	wrw(0x48000 + 7 * 2, 0x8200);          // frag 2 TSA0 (locked-handle payload)
+	wrw(0x48000 + 8 * 2, 0x8004);          // frag 2 TSA1 DIRTY -> true $48200
+	wrw(0x48000 + 9 * 2, 100);             // frag 2 TFS
+	wrw(0x48000 + 10 * 2, 0x8015);         // link: odd = end of list
+	for (int i = 0; i < 14; i++)  ram[0x48100 + i] = (uint8_t)(0x10 + i);
+	for (int i = 0; i < 100; i++) ram[0x48200 + i] = (uint8_t)(0x50 + i);
+	tx_count = 0;
+	sonic_reg_write(CR, 0x0002);           // TXP
+	check(tx_count == 1, "dirty-24bit TX: multi-fragment frame transmitted");
+	check(last_tx_len == 114 + 4, "dirty-24bit TX: both fragments + FCS");
+	check(memcmp(last_tx, ram + 0x48100, 14) == 0, "dirty-24bit TX: header fragment gathered (clean ptr)");
+	check(memcmp(last_tx + 14, ram + 0x48200, 100) == 0, "dirty-24bit TX: payload gathered via MASKED pointer");
+	check(rdw(0x48000) & 0x0001, "dirty-24bit TX: status written back at the masked TDA");
+	check(!(sonic_reg(CR) & 0x0002), "dirty-24bit TX: CR.TXP self-cleared");
+	check(sonic_reg(ISR) & 0x0200, "dirty-24bit TX: ISR_TXDN set");
+	check(backend_oob == 0, "dirty-24bit TX: no out-of-RAM address reached the backend");
+	check(sonic_ea_stripped() > eas0, "dirty-24bit TX: ea_stripped witness counted");
+
+	// RX with a dirty receive-buffer pointer: stores at the masked address,
+	// but the REGISTER advance and the published packet pointer keep the
+	// driver's top byte like real silicon (only the bus is 24-bit).
+	sonic_reg_write(ISR, 0x0640);          // clear TXDN + PKTRX + RDE
+	sonic_reg_write(CRDA, 0xB000);         // fresh descriptor at $4B000
+	wrw(0x4B00a, 0xB011);                  // link: odd = end of list after one
+	wrw(0x4B00c, 0xffff);                  // in-use
+	sonic_reg_write(CRBA0, 0x3000);
+	sonic_reg_write(CRBA1, 0x8006);        // dirty upper half -> true $63000
+	sonic_reg_write(RBWC0, 0x0800);
+	sonic_reg_write(RBWC1, 0x0000);
+	sonic_rx_frame(other, 60);             // broadcast (BRD still on)
+	check(sonic_reg(ISR) & 0x0400, "dirty-24bit RX: frame received (PKTRX)");
+	check(memcmp(ram + 0x63000, other, 60) == 0, "dirty-24bit RX: stored at the MASKED RBA");
+	check(rdw(0x4B000) & 0x0001, "dirty-24bit RX: RDA status has PRX");
+	check(rdw(0x4B004) == 0x3000 && rdw(0x4B006) == 0x8006,
+	      "dirty-24bit RX: published packet pointer keeps the driver's top byte");
+	check(sonic_reg(CRBA0) == 0x3040 && sonic_reg(CRBA1) == 0x8006,
+	      "dirty-24bit RX: CRBA register advance preserves the top byte");
+	check(backend_oob == 0, "dirty-24bit RX: no out-of-RAM address reached the backend");
 
 	printf(fails ? "%d FAILURES (mac_sonic_test)\n" : "ALL PASS (mac_sonic_test)\n", fails);
 	return fails != 0;
