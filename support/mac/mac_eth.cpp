@@ -130,6 +130,7 @@ static void ring_slurp(void);   // defined with the doorbell ring below
 
 // SONIC register indices + bits we watch (values from mac_sonic.cpp).
 #define SONIC_CR        0x00
+#define SONIC_CR_TXP    0x0002
 #define SONIC_IMR       0x04
 #define SONIC_ISR       0x05
 #define SONIC_CRDA      0x0E
@@ -564,9 +565,24 @@ void mac_eth_poll(void)
 	if (!card_up) return;
 
 	drain_ring();
-	// a transmit chain that hit its packet budget resumes here, now that
-	// the guest's queued register writes (ISR acks above all) are applied
+	// A transmit chain that hit its packet budget resumes here, now that the
+	// guest's queued register writes (ISR acks above all) are applied - and
+	// keeps alternating apply/resume until the chain truly ends. CR.TXP must
+	// NOT linger for a whole poll period: the guest driver spin-polls TXP
+	// after a kick with a TICKS-based timeout, and at its spin IPL the tick
+	// never advances - a visibly-slow TXP means an unbounded spin, and the
+	// guest hard-froze exactly that way (clock stopped, ping dead,
+	// 2026-08-26 upload stall #4). Alternating also breaks the opposite
+	// loop: with acks applied between chunks, MacTCP sees its ACKs, stops
+	// retransmitting, and the dynamic-append chain reaches a real end of
+	// list instead of walking retransmissions forever (stall #3). The spin
+	// bound is a backstop only - 32 rounds x 8 packets far exceeds any TCP
+	// window this guest can keep in flight.
 	sonic_tx_continue();
+	for (int spins = 32; (sonic_reg(SONIC_CR) & SONIC_CR_TXP) && spins; spins--) {
+		drain_ring();
+		sonic_tx_continue();
+	}
 
 	// Elasticity buffer: while the guest's RX ring is exhausted (RDE/RBE
 	// latched, or CRDA parked on an odd end-of-list link) the model refuses
