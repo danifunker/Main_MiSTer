@@ -584,6 +584,16 @@ void mac_eth_poll(void)
 		sonic_tx_continue();
 	}
 
+	// the driver's deadman: tick the SONIC watchdog with real elapsed time
+	// so ISR_TC fires when traffic stops and its recovery paths actually run
+	{
+		static uint64_t tick_last;
+		uint64_t nowu = now_us();
+		if (tick_last && nowu > tick_last)
+			sonic_time_tick((unsigned)(nowu - tick_last));
+		tick_last = nowu;
+	}
+
 	// Elasticity buffer: while the guest's RX ring is exhausted (RDE/RBE
 	// latched, or CRDA parked on an odd end-of-list link) the model refuses
 	// frames. The guest clears that only after its ISR runs - which the FPGA's

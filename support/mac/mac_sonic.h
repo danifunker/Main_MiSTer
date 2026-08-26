@@ -44,6 +44,10 @@ int      sonic_rx_frame(const uint8_t *frame, int len);
 // set). Call from the service poll after applying pending register writes;
 // a no-op when no chain is suspended.
 void     sonic_tx_continue(void);
+// Advance the watchdog timer by `us` microseconds of wall time (the Apple
+// driver's deadman - it re-arms WT constantly and relies on ISR_TC for its
+// timeout/recovery paths). Call from the service poll.
+void     sonic_time_tick(unsigned us);
 uint32_t sonic_ea_stripped(void);              // dirty-top-byte addrs masked (24-bit-mode witness)
 
 #endif

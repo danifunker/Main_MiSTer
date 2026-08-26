@@ -440,6 +440,29 @@ int main()
 	wrongdst[5] ^= 0xff;                   // unknown unicast: CAM rejects
 	check(sonic_rx_frame(wrongdst, 60) == 0, "rx-contract: address-filtered -> 0 (not retryable)");
 
+	// ── watchdog timer: the driver's deadman must actually fire ──────
+	// The Apple driver re-arms {WT1,WT0} on nearly every interrupt and
+	// unmasks ISR_TC; its timeout/recovery paths (ring repair above all)
+	// only run when TC fires. A model that stores the writes but never
+	// counts leaves every wedge permanent (2026-08-26 upload stall #5).
+	enum { WT0r = 0x29, WT1r = 0x2A };
+	sonic_reg_write(0, 0x0020);            // CR: ST (start timer)
+	sonic_reg_write(WT0r, 0x9C40);         // 40,000 counts = 5 ms at 8/us
+	sonic_reg_write(WT1r, 0x0000);
+	sonic_reg_write(4, 0x0080);            // IMR: unmask TC
+	sonic_time_tick(1000);                 // 1 ms
+	check(!(sonic_reg(5) & 0x0080), "watchdog: not expired at 1 ms");
+	check(sonic_reg(WT0r) == 0x9C40 - 8000, "watchdog: counts down at ~8/us");
+	sonic_time_tick(4500);                 // total 5.5 ms
+	check(sonic_reg(5) & 0x0080, "watchdog: TC fired on expiry");
+	check(sonic_int_line(), "watchdog: TC raises the int line via IMR");
+	sonic_reg_write(5, 0x0080);            // ack TC
+	sonic_time_tick(10000);
+	check(!(sonic_reg(5) & 0x0080), "watchdog: no refire until re-armed");
+	sonic_reg_write(WT0r, 0x0010);         // re-arm tiny
+	sonic_time_tick(100);
+	check(sonic_reg(5) & 0x0080, "watchdog: fires again after re-arm");
+
 	printf(fails ? "%d FAILURES (mac_sonic_test)\n" : "ALL PASS (mac_sonic_test)\n", fails);
 	return fails != 0;
 }

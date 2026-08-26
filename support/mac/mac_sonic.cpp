@@ -69,6 +69,7 @@ enum {
 
 #define ISR_RBE  0x0020
 #define ISR_RDE  0x0040
+#define ISR_TC   0x0080
 #define ISR_TXDN 0x0200
 #define ISR_PKTRX 0x0400
 #define ISR_PINT 0x0800
@@ -453,6 +454,33 @@ static void transmit_chain(void)
 void sonic_tx_continue(void)
 {
 	if ((reg[CR] & (CR_TXP | CR_RST)) == CR_TXP) transmit_chain();
+}
+
+// ── watchdog timer ──────────────────────────────────────────────────────
+// {WT1,WT0} is the chip's 32-bit general-purpose down-counter (one count
+// per two bus clocks; the LC PDS bus gives ~8 counts/us). The Apple driver
+// leans on it as its DEADMAN: it re-arms WT on (almost) every interrupt
+// (10,567 arms in one session) and unmasks ISR_TC - if traffic stops, TC
+// fires and its timeout handler runs recovery. The model stored the writes
+// but never counted, so TC never fired and every wedge that real silicon
+// would shake off (a parked receive ring above all) was PERMANENT: the
+// guest sat mute with a ticking clock and no driver recovery (2026-08-26
+// upload stall #5). Tick it from the service poll with elapsed wall time;
+// TC fires once per expiry (the driver re-arms by rewriting WT).
+void sonic_time_tick(unsigned us)
+{
+	if (!(reg[CR] & CR_ST)) return;
+	uint32_t wt = ((uint32_t)reg[WT1] << 16) | reg[WT0];
+	if (!wt) return;                      // expired and not yet re-armed
+	uint32_t dec = us * 8;                // ~8 counts per microsecond
+	if (wt > dec) {
+		wt -= dec;
+	} else {
+		wt = 0;
+		reg[ISR] |= ISR_TC;               // the deadman the driver waits for
+	}
+	reg[WT0] = (uint16_t)wt;
+	reg[WT1] = (uint16_t)(wt >> 16);
 }
 
 // ── command / register writes ───────────────────────────────────────────
