@@ -164,7 +164,17 @@ static int dma_rpc(uint32_t gaddr, uint32_t len, int wr)
 		uint64_t s = *w64(ETH_OFF_DMASTAT);
 		if ((s & 0xff) == dma_seq) { rc = (s & 0x100) ? -1 : 0; break; }
 		el = now_us() - t0;
-		if (el > 50000) {              // 50 ms = FPGA gone
+		// Patience budget: the engine can genuinely need tens of ms - its
+		// dispatch yields to every guest bus cycle (cpu_waiting) and every
+		// doorbell publish, and a driver that just kicked TXP spin-polls
+		// the card while it waits, which is exactly when the big transfer
+		// is in flight. Declaring death at 50 ms aborted the transmit, the
+		// guest polled for a TXDN that never came, its ISR-ack writes
+		// overflowed the doorbell ring (52 lost register writes, 2026-08-26
+		// upload stall) and the whole TCP send engine wedged. The rare slow
+		// RPC completes; wait it out. 250 ms of pump pause is absorbed by
+		// the 1 MB socket buffer and the held-unicast queue.
+		if (el > 250000) {
 			printf("mac_eth: DMA-RPC timeout (seq %u addr 0x%x len %u)\n",
 			       dma_seq, gaddr, len);
 			break;
