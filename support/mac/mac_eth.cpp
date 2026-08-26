@@ -54,6 +54,7 @@ static struct {
 	uint64_t rx_ours, rx_ours_bytes;  // frames actually addressed to the guest
 	uint64_t rx_arp, tx_arp;    // ethertype 0x0806 each way
 	uint64_t rx_ip,  tx_ip;     // ethertype 0x0800 each way
+	uint64_t rx_held, rx_held_max;    // unicasts held for redelivery / depth watermark
 } st;
 static uint8_t  guest_mac[6];
 static char     ifname[64] = "eth0";
@@ -419,12 +420,56 @@ static void card_start(void)
 	       guest_mac[3], guest_mac[4], guest_mac[5]);
 }
 
+// ── held-unicast redelivery queue (see the pump comment in mac_eth_poll) ──
+// Depth: in-flight unicast toward the guest is bounded by its TCP receive
+// window (MacTCP ~16 KB ≈ 11 segments); 64 covers that with margin for the
+// odd extra flow. Age cap: 2 s is past any plausible ISR latency — a frame
+// still held then is real loss (guest wedged or receiver off) and dropping
+// it is correct.
+#define RXQ_DEPTH      64
+#define RXQ_MAX_AGE_US 2000000ULL
+static struct { uint8_t buf[1600]; int len; uint64_t t; } rxq[RXQ_DEPTH];
+static int rxq_head, rxq_count;
+
+static void rxq_reset(void) { rxq_head = rxq_count = 0; }
+
+static void rxq_push(const uint8_t *f, int n)
+{
+	if (n > (int)sizeof rxq[0].buf || rxq_count == RXQ_DEPTH) {
+		st.rx_refused++;   // tail-drop: a full queue means the guest stopped draining
+		return;
+	}
+	int slot = (rxq_head + rxq_count) % RXQ_DEPTH;
+	memcpy(rxq[slot].buf, f, n);
+	rxq[slot].len = n;
+	rxq[slot].t = now_us();
+	rxq_count++;
+	st.rx_held++;
+	if ((uint64_t)rxq_count > st.rx_held_max) st.rx_held_max = rxq_count;
+}
+
+static void rxq_flush(void)
+{
+	uint64_t now = now_us();
+	while (rxq_count) {
+		if (now - rxq[rxq_head].t > RXQ_MAX_AGE_US) {
+			st.rx_refused++;                    // expired: count as real loss
+		} else {
+			int r = sonic_rx_frame(rxq[rxq_head].buf, rxq[rxq_head].len);
+			if (r < 0) return;                  // still busy: keep holding, in order
+		}
+		rxq_head = (rxq_head + 1) % RXQ_DEPTH;
+		rxq_count--;
+	}
+}
+
 static void card_stop(void)
 {
 	if (!card_up) return;
 	*w64(ETH_OFF_MAGIC) = 0;
 	mac_eth_iface_close();
 	card_up = 0;
+	rxq_reset();   // held frames belong to the closed session
 	printf("mac_eth: card down\n");
 }
 
@@ -471,9 +516,18 @@ void mac_eth_poll(void)
 
 	drain_ring();
 
-	// Bounded receive pump: the model filters and DMAs into guest RAM. Bound
-	// by TIME, not a frame count - a fixed count starves the drain when RPCs
-	// run slow and needlessly caps it when they run fast.
+	// Elasticity buffer: while the guest's RX ring is exhausted (RDE/RBE
+	// latched, or CRDA parked on an odd end-of-list link) the model refuses
+	// frames. The guest clears that only after its ISR runs - which the FPGA's
+	// interrupt suppression window can delay ~2 ms - so a sender's burst used
+	// to lose its tail. Linux TCP answers burst loss with exponential RTO
+	// backoff: measured on the FTP data socket as rto 111 s / backoff 9 / 55%
+	// of bytes retransmitted = the 2-4 KB/s crawl. Hold refused UNICAST
+	// frames here (in order) and redeliver when the ring frees: the burst
+	// becomes a few ms of delay and TCP never backs off. Broadcast loss stays
+	// free - the LAN flood must not squat the queue. Bounded by depth and age
+	// so a wedged guest drops traffic, never the pump.
+	rxq_flush();
 	uint8_t frame[2048];
 	uint64_t rx_t0 = now_us();
 	while (now_us() - rx_t0 < 1000) {
@@ -483,7 +537,8 @@ void mac_eth_poll(void)
 		// eth0 is promiscuous, so rx_frames counts ALL LAN traffic -
 		// including our own ssh. Count what is actually addressed to the
 		// guest separately or the totals flatter the transfer.
-		if ((frame[0] & 1) || !memcmp(frame, guest_mac, 6)) {
+		int unicast_ours = !(frame[0] & 1) && !memcmp(frame, guest_mac, 6);
+		if ((frame[0] & 1) || unicast_ours) {
 			st.rx_ours++; st.rx_ours_bytes += n;
 			if (n >= 14) {
 				unsigned et = ((unsigned)frame[12] << 8) | frame[13];
@@ -491,12 +546,14 @@ void mac_eth_poll(void)
 				else if (et == 0x0800) st.rx_ip++;
 			}
 		}
-		// The model silently refuses EVERY frame while RXEN is clear or
-		// RDE/RBE is latched - the "transfer just stopped" signature.
-		// Count those apart or the socket tally hides the stall.
-		if (!(sonic_reg(SONIC_CR) & SONIC_CR_RXEN) ||
-		    (sonic_reg(SONIC_ISR) & SONIC_ISR_RXEXH)) st.rx_refused++;
-		sonic_rx_frame(frame, n);
+		// Order matters within the guest's unicast stream: while held frames
+		// exist, a new unicast goes behind them even if the ring is free now.
+		if (unicast_ours && rxq_count) { rxq_push(frame, n); continue; }
+		if (sonic_rx_frame(frame, n) < 0) {
+			// refused before any state was touched: hold unicast, drop the rest
+			if (unicast_ours) rxq_push(frame, n);
+			else st.rx_refused++;
+		}
 	}
 
 	push_state();
@@ -521,6 +578,8 @@ void mac_eth_poll(void)
 			fprintf(f, "txp_cmds   %llu\n", (unsigned long long)st.txp_cmds);
 			fprintf(f, "tx_fail    %llu\n", (unsigned long long)st.tx_fail);
 			fprintf(f, "ea_strip   %u\n", sonic_ea_stripped());
+			fprintf(f, "rx_held    %llu  max_depth %llu\n",
+			        (unsigned long long)st.rx_held, (unsigned long long)st.rx_held_max);
 			fprintf(f, "rx_ours    %llu  bytes %llu\n",
 			        (unsigned long long)st.rx_ours, (unsigned long long)st.rx_ours_bytes);
 			fprintf(f, "arp        rx %llu  tx %llu\n",

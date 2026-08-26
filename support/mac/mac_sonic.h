@@ -30,7 +30,13 @@ void     sonic_reg_write(int reg, uint16_t data);
 uint16_t sonic_reg(int reg);                   // current value (shadow source)
 void     sonic_fill_shadows(uint16_t regs[64]);
 int      sonic_int_line(void);                 // level: ISR & IMR & 0x7fff
-void     sonic_rx_frame(const uint8_t *frame, int len);  // frame WITHOUT FCS
+// Deliver one frame (WITHOUT FCS) into the guest's RX structures.
+// Returns 1 = delivered, 0 = filtered/dropped (address filter, runt, or a
+// failure after descriptor state already advanced - NOT retryable), -1 =
+// BUSY before any state was touched (RXEN clear, RDE/RBE latched, or no
+// free descriptor): the caller may hold the frame and retry once the guest
+// services its ring - dropping it instead costs a TCP retransmit timeout.
+int      sonic_rx_frame(const uint8_t *frame, int len);
 uint32_t sonic_ea_stripped(void);              // dirty-top-byte addrs masked (24-bit-mode witness)
 
 #endif

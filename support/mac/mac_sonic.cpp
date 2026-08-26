@@ -243,26 +243,29 @@ static int address_filter(const uint8_t *buf)
 	return 0;
 }
 
-// frame WITHOUT FCS; model appends the computed FCS (see header note)
-void sonic_rx_frame(const uint8_t *frame, int len)
+// frame WITHOUT FCS; model appends the computed FCS (see header note).
+// Return contract (see mac_sonic.h): -1 only on the BUSY exits that happen
+// before any guest-visible state is touched, so the caller can safely retry
+// the same frame later; anything past the first mutation returns 0/1.
+int sonic_rx_frame(const uint8_t *frame, int len)
 {
 	uint8_t buf[1524];
 
-	if (!host) return;
-	if (len <= 0 || len > 1518) return;
-	if (!(reg[CR] & CR_RXEN) || (reg[ISR] & (ISR_RDE | ISR_RBE))) return;
+	if (!host) return -1;
+	if (len <= 0 || len > 1518) return 0;
+	if (!(reg[CR] & CR_RXEN) || (reg[ISR] & (ISR_RDE | ISR_RBE))) return -1;
 
 	// reload receive descriptor address after end-of-list
 	if (reg[CRDA] & 1) {
 		uint16_t v;
-		if (host->read_words(DA(reg[URDA], reg[LLFA]), &v, 1, WIDTH())) return;
+		if (host->read_words(DA(reg[URDA], reg[LLFA]), &v, 1, WIDTH())) return -1;
 		reg[CRDA] = v;
-		if (reg[CRDA] & 1) return;
+		if (reg[CRDA] & 1) return -1;   // still no free descriptor: ring empty
 	}
 
 	reg[RCR] &= (uint16_t)~(RCR_MC | RCR_BC | RCR_LPKT | RCR_CRCR | RCR_FAER | RCR_LBK | RCR_PRX);
 
-	if (!address_filter(frame)) return;
+	if (!address_filter(frame)) return 0;
 
 	memcpy(buf, frame, len);
 	uint32_t const fcs = crc32_eth(buf, len);
@@ -272,7 +275,7 @@ void sonic_rx_frame(const uint8_t *frame, int len)
 	buf[len + 3] = (uint8_t)(fcs >> 24);
 	int length = len + 4;
 
-	if (length < 64 && !(reg[RCR] & RCR_RNT)) return;
+	if (length < 64 && !(reg[RCR] & RCR_RNT)) return 0;
 	reg[RCR] |= RCR_PRX;
 	if (reg[RCR] & RCR_LB) reg[RCR] |= RCR_LBK;
 
@@ -286,7 +289,7 @@ void sonic_rx_frame(const uint8_t *frame, int len)
 	// (advance the CRBA register from the RAW 32-bit value — real silicon
 	// keeps the top byte the driver wrote; only the bus address is 24-bit)
 	uint32_t const rba_reg = ((uint32_t)reg[CRBA1] << 16) | reg[CRBA0];
-	if (host->write_bytes(EA(reg[CRBA1], reg[CRBA0]), buf, length)) return;
+	if (host->write_bytes(EA(reg[CRBA1], reg[CRBA0]), buf, length)) return 0;
 
 	uint32_t const crba = rba_reg + length;
 	reg[CRBA1] = (uint16_t)(crba >> 16);
@@ -312,15 +315,15 @@ void sonic_rx_frame(const uint8_t *frame, int len)
 	const int w = WIDTH();
 	uint32_t const rda = DA(reg[URDA], reg[CRDA]);
 	uint16_t st[5] = { reg[RCR], (uint16_t)length, reg[TRBA0], reg[TRBA1], reg[RSC] };
-	if (host->write_words(rda + 1 * w, st + 1, 4, w)) return;   // count/ptrs/seq
+	if (host->write_words(rda + 1 * w, st + 1, 4, w)) return 0;   // count/ptrs/seq
 	reg[LLFA] = (uint16_t)(reg[CRDA] + 5 * w);
 	uint16_t link;
-	if (host->read_words(rda + 5 * w, &link, 1, w)) return;
+	if (host->read_words(rda + 5 * w, &link, 1, w)) return 0;
 	if (!(link & 1)) {
 		uint16_t zero = 0;
 		host->write_words(rda + 6 * w, &zero, 1, w);   // clear in-use
 	}
-	if (host->write_words(rda, st, 1, w)) return;       // status: the publish
+	if (host->write_words(rda, st, 1, w)) return 0;     // status: the publish
 	reg[CRDA] = link;
 
 	if (reg[CRDA] & 1)
@@ -332,6 +335,7 @@ void sonic_rx_frame(const uint8_t *frame, int len)
 		reg[RSC] = (uint16_t)((reg[RSC] & 0xff00) | (uint8_t)(reg[RSC] + 1));
 
 	reg[ISR] |= ISR_PKTRX;
+	return 1;
 }
 
 // ── transmit ────────────────────────────────────────────────────────────

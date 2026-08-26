@@ -361,6 +361,32 @@ int main()
 	      "dirty-24bit RX: CRBA register advance preserves the top byte");
 	check(backend_oob == 0, "dirty-24bit RX: no out-of-RAM address reached the backend");
 
+	// ── sonic_rx_frame return contract (drives the host's redelivery queue) ──
+	// -1 must mean "busy before any state was touched" (safe to retry the
+	// same frame); 0 = filtered/dropped; 1 = delivered. The host holds
+	// refused unicasts on -1 and redelivers when the ring frees - dropping
+	// them instead cost a Linux-TCP RTO backoff spiral (rto 111 s, 55%
+	// retransmit = the 2-4 KB/s FTP crawl measured 2026-08-26).
+	check(sonic_reg(ISR) & 0x0040, "rx-contract: RDE latched by the previous test");
+	check(sonic_rx_frame(other, 60) == -1, "rx-contract: RDE latched -> -1 (retryable)");
+	sonic_reg_write(ISR, 0x0440);          // clear PKTRX + RDE; CRDA still odd EOL
+	check(sonic_rx_frame(other, 60) == -1, "rx-contract: no free descriptor -> -1 (retryable)");
+	wrw(0x4B00a, 0xB100);                  // driver appends: link now points to a fresh RDA
+	wrw(0x4B10a, 0xB111);                  // its link: odd = end of list
+	wrw(0x4B10c, 0xffff);                  // in-use
+	check(sonic_rx_frame(other, 60) == 1, "rx-contract: reload finds the appended RDA -> 1");
+	check(rdw(0x4B100) & 0x0001, "rx-contract: delivered via the appended descriptor");
+	// the model checks descriptor availability BEFORE the address filter, so
+	// give it a free descriptor or the busy -1 masks the filter's 0
+	wrw(0x4B10a, 0xB200);
+	wrw(0x4B20a, 0xB211);
+	wrw(0x4B20c, 0xffff);
+	sonic_reg_write(ISR, 0x0440);
+	uint8_t wrongdst[60];
+	memcpy(wrongdst, frame, 60);
+	wrongdst[5] ^= 0xff;                   // unknown unicast: CAM rejects
+	check(sonic_rx_frame(wrongdst, 60) == 0, "rx-contract: address-filtered -> 0 (not retryable)");
+
 	printf(fails ? "%d FAILURES (mac_sonic_test)\n" : "ALL PASS (mac_sonic_test)\n", fails);
 	return fails != 0;
 }
