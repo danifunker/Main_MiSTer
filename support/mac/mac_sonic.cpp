@@ -262,6 +262,23 @@ int sonic_rx_frame(const uint8_t *frame, int len)
 		if (host->read_words(DA(reg[URDA], reg[LLFA]), &v, 1, WIDTH())) return -1;
 		reg[CRDA] = v;
 		if (reg[CRDA] & 1) return -1;   // still no free descriptor: ring empty
+		// The ring rejoined: RELEASE the descriptor being left (in_use = 0,
+		// the field after the link LLFA points at). The normal advance below
+		// releases only descriptors left with an even link; one left via THIS
+		// reload kept in_use = FFFF forever (MAME has the same gap - its TODO
+		// list stops at the "watchdog timers" this papered over). The Apple
+		// LC driver re-appends a freed descriptor to the ring ONLY when
+		// in_use is 0 ($c(desc) gate at .ENET 0x15be), else defers it to a
+		// list drained ONLY on the next PKTRX - and a bulk upload's steady
+		// state (single ACK consumed at the tail, park, single re-append)
+		// makes EVERY descriptor leave via reload: all frees deferred, no
+		// appends, no PKTRX possible = the 2026-08-26 upload wedge (crda
+		// parked on a bare 0001 tail link, guest deaf-mute, clock ticking).
+		// The driver only runs its chip-reset TC workaround on silicon
+		// revision <= 3 (.ENET 0x166e reads SR, rts if > 3): rev>3 silicon
+		// self-recovers, i.e. does exactly this release - and we report SR 6.
+		uint16_t zero = 0;
+		host->write_words(DA(reg[URDA], reg[LLFA]) + WIDTH(), &zero, 1, WIDTH());
 	}
 
 	reg[RCR] &= (uint16_t)~(RCR_MC | RCR_BC | RCR_LPKT | RCR_CRCR | RCR_FAER | RCR_LBK | RCR_PRX);
@@ -457,22 +474,24 @@ void sonic_tx_continue(void)
 }
 
 // ── watchdog timer ──────────────────────────────────────────────────────
-// {WT1,WT0} is the chip's 32-bit general-purpose down-counter (one count
-// per two bus clocks; the LC PDS bus gives ~8 counts/us). The Apple driver
-// leans on it as its DEADMAN: it re-arms WT on (almost) every interrupt
-// (10,567 arms in one session) and unmasks ISR_TC - if traffic stops, TC
-// fires and its timeout handler runs recovery. The model stored the writes
-// but never counted, so TC never fired and every wedge that real silicon
-// would shake off (a parked receive ring above all) was PERMANENT: the
-// guest sat mute with a ticking clock and no driver recovery (2026-08-26
-// upload stall #5). Tick it from the service poll with elapsed wall time;
-// TC fires once per expiry (the driver re-arms by rewriting WT).
+// {WT1,WT0} is the chip's 32-bit general-purpose down-counter, one count
+// per two bus clocks: the LC card's SONIC runs from a 20 MHz crystal, so
+// 10 counts/us. The Apple LC driver arms 0x02FAF080 = 50,000,000 counts =
+// a round 5.0 s deadman (which is how the rate was confirmed) and re-arms
+// it at the end of every receive pass. Disassembly of the driver's TC
+// handler (.ENET 0x166e) showed the timeout RECOVERY - the CRDA-parked
+// check and chip reset - runs only on silicon revision <= 3; on the SR 6
+// we report, TC is acknowledged and counted, nothing more. So the timer
+// exists for fidelity (the driver arms it and acks TC), not as the upload
+// -wedge fix: that is the reload-path in_use release in sonic_rx_frame.
+// Tick from the service poll with elapsed wall time; fires once per
+// expiry, quiet until the driver rewrites WT.
 void sonic_time_tick(unsigned us)
 {
 	if (!(reg[CR] & CR_ST)) return;
 	uint32_t wt = ((uint32_t)reg[WT1] << 16) | reg[WT0];
 	if (!wt) return;                      // expired and not yet re-armed
-	uint32_t dec = us * 8;                // ~8 counts per microsecond
+	uint32_t dec = us * 10;               // 20 MHz bus clock / 2
 	if (wt > dec) {
 		wt -= dec;
 	} else {
