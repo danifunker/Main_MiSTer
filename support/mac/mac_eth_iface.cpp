@@ -15,12 +15,15 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <dirent.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
 #include <linux/if_tun.h>
+#include <linux/ethtool.h>
+#include <linux/sockios.h>
 #include <arpa/inet.h>
 
 #include "mac_eth.h"
@@ -61,6 +64,41 @@ static int open_tap(const char *name)
 	iface_up(ifr.ifr_name);
 	printf("mac_eth: opened tap %s\n", ifr.ifr_name);
 	return 1;
+}
+
+// The kernel's GRO (generic receive offload) coalesces back-to-back TCP
+// segments into super-frames BEFORE an AF_PACKET tap sees them - so under
+// any burst the tap received 2920+-byte "frames" that no real wire carries.
+// The SONIC model rightly refuses frames over 1518 bytes, so every
+// coalesced burst toward the guest was silently lost while solitary
+// segments (retransmits, ACKs, ARP, ping) passed - Linux TCP answered the
+// pattern with an RTO-backoff spiral: the 2-4 KB/s FTP crawl, root-caused
+// 2026-08-26 with a two-point capture (tcpsnoop) after every deeper layer
+// measured healthy. Switch GRO off on the tapped interface so frames
+// arrive wire-sized; on a macvlan/vlan child GRO runs on the parent, so
+// walk lower_* and switch it off there too.
+static void iface_gro_off(int fd, const char *name, int depth)
+{
+	struct ethtool_value ev;
+	struct ifreq ifr;
+	memset(&ifr, 0, sizeof ifr);
+	strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+	ev.cmd  = ETHTOOL_SGRO;
+	ev.data = 0;
+	ifr.ifr_data = (char *)&ev;
+	if (ioctl(fd, SIOCETHTOOL, &ifr) == 0)
+		printf("mac_eth: GRO off on %s\n", name);
+
+	if (depth >= 2) return;   // lower_ chains are short; guard anyway
+	char path[128];
+	snprintf(path, sizeof path, "/sys/class/net/%s", name);
+	DIR *d = opendir(path);
+	if (!d) return;
+	struct dirent *e;
+	while ((e = readdir(d)))
+		if (!strncmp(e->d_name, "lower_", 6))
+			iface_gro_off(fd, e->d_name + 6, depth + 1);
+	closedir(d);
 }
 
 static int open_raw(const char *name)
@@ -104,6 +142,8 @@ static int open_raw(const char *name)
 
 	if (setsockopt(sock_fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof mreq) < 0)
 		printf("mac_eth: promisc membership on %s failed\n", name);
+
+	iface_gro_off(sock_fd, name, 0);
 
 	printf("mac_eth: opened raw %s (ifindex %d, promisc)\n", name, ifindex);
 	return 1;

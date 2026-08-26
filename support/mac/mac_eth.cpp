@@ -55,6 +55,7 @@ static struct {
 	uint64_t rx_arp, tx_arp;    // ethertype 0x0806 each way
 	uint64_t rx_ip,  tx_ip;     // ethertype 0x0800 each way
 	uint64_t rx_held, rx_held_max;    // unicasts held for redelivery / depth watermark
+	uint64_t rx_jumbo;          // >1518-byte frames off the tap: offload leak witness
 } st;
 static uint8_t  guest_mac[6];
 static char     ifname[64] = "eth0";
@@ -534,6 +535,13 @@ void mac_eth_poll(void)
 		int n = mac_eth_iface_recv(frame, sizeof frame);
 		if (n <= 0) break;
 		st.rx_frames++; st.rx_bytes += n;
+		// No real wire carries >1518 bytes here: an oversized "frame" means a
+		// receive offload (GRO/LRO) is coalescing segments before the tap and
+		// the model will refuse them - the silent-loss class that cost the
+		// FTP crawl. iface_gro_off() prevents it; this witness makes any
+		// recurrence (new kernel, new offload, macvlan parent) visible.
+		if (n > 1518 && st.rx_jumbo++ == 0)
+			printf("mac_eth: %d-byte frame off the tap - receive offload leaking (GRO?)\n", n);
 		// eth0 is promiscuous, so rx_frames counts ALL LAN traffic -
 		// including our own ssh. Count what is actually addressed to the
 		// guest separately or the totals flatter the transfer.
@@ -580,6 +588,7 @@ void mac_eth_poll(void)
 			fprintf(f, "ea_strip   %u\n", sonic_ea_stripped());
 			fprintf(f, "rx_held    %llu  max_depth %llu\n",
 			        (unsigned long long)st.rx_held, (unsigned long long)st.rx_held_max);
+			fprintf(f, "rx_jumbo   %llu\n", (unsigned long long)st.rx_jumbo);
 			fprintf(f, "rx_ours    %llu  bytes %llu\n",
 			        (unsigned long long)st.rx_ours, (unsigned long long)st.rx_ours_bytes);
 			fprintf(f, "arp        rx %llu  tx %llu\n",
