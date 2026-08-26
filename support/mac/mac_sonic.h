@@ -21,6 +21,9 @@ typedef struct {
 	int (*write_words)(uint32_t gaddr, const uint16_t *w, int n, int stride);
 	int (*read_bytes)(uint32_t gaddr, uint8_t *b, int n);
 	int (*write_bytes)(uint32_t gaddr, const uint8_t *b, int n);
+	// frame WITHOUT FCS (mirrors sonic_rx_frame): the transport appends its
+	// own. Adding the model's software FCS made max-size frames 1518 bytes,
+	// which a raw socket refuses (EMSGSIZE past MTU 1500 + 14 header).
 	int (*wire_send)(const uint8_t *frame, int len);
 } sonic_host_ops;
 

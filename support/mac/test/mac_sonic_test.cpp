@@ -204,7 +204,7 @@ int main()
 	tx_count = 0;
 	sonic_reg_write(CR, 0x0002);     // TXP
 	check(tx_count == 1, "TXP transmitted one frame");
-	check(last_tx_len == TLEN + 4, "TX appended the FCS");
+	check(last_tx_len == TLEN, "TX wire frame has NO software FCS (transport appends its own)");
 	check(memcmp(last_tx, ram + 0x47000, TLEN) == 0, "TX gathered the fragment");
 	check(rdw(0x45000) & 0x0001, "TX status written back with PTX");
 	check(sonic_reg(ISR) & 0x0200, "end-of-list set ISR_TXDN");
@@ -253,7 +253,7 @@ int main()
 	sonic_reg_write(ISR, 0x0200);          // clear any stale TXDN
 	sonic_reg_write(CR, 0x0002);           // TXP with CTDA odd
 	check(tx_count == 1, "odd-EOL CTDA: TXP transmitted (word-aligned fetch, no wedge)");
-	check(last_tx_len == TLEN + 4, "odd-EOL CTDA: FCS appended");
+	check(last_tx_len == TLEN, "odd-EOL CTDA: wire frame without software FCS");
 	check(memcmp(last_tx, ram + 0x47000, TLEN) == 0, "odd-EOL CTDA: fragment gathered from $47000");
 	check(!(sonic_reg(CR) & 0x0002), "odd-EOL CTDA: CR.TXP self-cleared (releases the guest TXP-poll)");
 	check(sonic_reg(ISR) & 0x0200, "odd-EOL CTDA: ISR_TXDN set");
@@ -331,7 +331,7 @@ int main()
 	tx_count = 0;
 	sonic_reg_write(CR, 0x0002);           // TXP
 	check(tx_count == 1, "dirty-24bit TX: multi-fragment frame transmitted");
-	check(last_tx_len == 114 + 4, "dirty-24bit TX: both fragments + FCS");
+	check(last_tx_len == 114, "dirty-24bit TX: both fragments, no software FCS");
 	check(memcmp(last_tx, ram + 0x48100, 14) == 0, "dirty-24bit TX: header fragment gathered (clean ptr)");
 	check(memcmp(last_tx + 14, ram + 0x48200, 100) == 0, "dirty-24bit TX: payload gathered via MASKED pointer");
 	check(rdw(0x48000) & 0x0001, "dirty-24bit TX: status written back at the masked TDA");
@@ -339,6 +339,27 @@ int main()
 	check(sonic_reg(ISR) & 0x0200, "dirty-24bit TX: ISR_TXDN set");
 	check(backend_oob == 0, "dirty-24bit TX: no out-of-RAM address reached the backend");
 	check(sonic_ea_stripped() > eas0, "dirty-24bit TX: ea_stripped witness counted");
+
+	// Max-size frame on the wire: 1514 bytes must reach wire_send as 1514.
+	// The model used to append its software FCS here too (1518), and a raw
+	// socket refuses anything past MTU 1500 + 14 header with EMSGSIZE - so
+	// every full-size TX frame silently died while smaller ones passed:
+	// bulk uploads stalled at MacTCP's RTO cadence (2026-08-26).
+	sonic_reg_write(ISR, 0x0200);
+	sonic_reg_write(CTDA, 0x8800);         // fresh TDA at true $48800
+	wrw(0x48800 + 1 * 2, 0x0000);          // config
+	wrw(0x48800 + 2 * 2, 1514);            // TPS
+	wrw(0x48800 + 3 * 2, 1);               // TFC
+	wrw(0x48800 + 4 * 2, 0x9000);          // TSA0 -> $49000
+	wrw(0x48800 + 5 * 2, 0x0004);          // TSA1
+	wrw(0x48800 + 6 * 2, 1514);            // TFS: a full-size ethernet frame
+	wrw(0x48800 + 7 * 2, 0x8811);          // link: odd = end of list
+	for (int i = 0; i < 1514; i++) ram[0x49000 + i] = (uint8_t)(i * 7);
+	tx_count = 0;
+	sonic_reg_write(CR, 0x0002);           // TXP
+	check(tx_count == 1, "max-size TX: frame transmitted");
+	check(last_tx_len == 1514, "max-size TX: exactly 1514 on the wire (no FCS overshoot)");
+	check(memcmp(last_tx, ram + 0x49000, 1514) == 0, "max-size TX: payload intact");
 
 	// RX with a dirty receive-buffer pointer: stores at the masked address,
 	// but the REGISTER advance and the published packet pointer keep the

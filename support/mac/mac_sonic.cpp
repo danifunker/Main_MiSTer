@@ -389,13 +389,23 @@ static void transmit_chain(void)
 		reg[CTDA] = (uint16_t)(reg[CTDA] + word * w);
 
 		// send: loopback modes short-circuit into the receive path (Mac
-		// driver open-time self-test); otherwise out the wire
-		if (reg[RCR] & RCR_LB) {
+		// driver open-time self-test); otherwise out the wire. BOTH paths
+		// strip the FCS the model just computed: the rx path re-appends its
+		// own, and the AF_PACKET wire gets a real FCS from the NIC - our 4
+		// software bytes would ride as payload and push a max-size segment
+		// (1514) to 1518, which the kernel refuses outright (EMSGSIZE: raw
+		// sends cap at MTU 1500 + 14 header). That silently killed every
+		// full-size TX frame - bulk uploads stalled at MacTCP's RTO cadence
+		// (tx_bytes +1518 every ~15 s, tx_fail counting) while ARP/ACKs/
+		// small segments passed under the limit (2026-08-26 upload stall).
+		{
 			int plen = (int)length;
-			if (!(reg[TCR] & TCR_CRCI)) plen -= 4;   // rx path re-appends FCS
-			sonic_rx_frame(buf, plen);
-		} else
-			host->wire_send(buf, (int)length);
+			if (!(reg[TCR] & TCR_CRCI)) plen -= 4;
+			if (reg[RCR] & RCR_LB)
+				sonic_rx_frame(buf, plen);
+			else
+				host->wire_send(buf, plen);
+		}
 
 		// completion (MAME send_complete_cb, success path)
 		reg[TCR] |= TCR_PTX;
