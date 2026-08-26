@@ -56,6 +56,7 @@ static struct {
 	uint64_t rx_ip,  tx_ip;     // ethertype 0x0800 each way
 	uint64_t rx_held, rx_held_max;    // unicasts held for redelivery / depth watermark
 	uint64_t rx_jumbo;          // >1518-byte frames off the tap: offload leak witness
+	uint64_t drain_full;        // drain budget exhausted with stash left: flood witness
 } st;
 static uint8_t  guest_mac[6];
 static char     ifname[64] = "eth0";
@@ -385,10 +386,27 @@ static void ring_slurp(void)
 	*w64(ETH_OFF_RPTR) = rptr;   // release the guest-bus throttle
 }
 
+// Bounded per call, and the shadows are republished after EVERY applied
+// entry. Both halves are load-bearing (2026-08-26 upload livelock, watched
+// live at 80,000 doorbell writes/s): the guest ISR loops re-reading ISR
+// from the FPGA SHADOW until the bits it acked read back clear - and the
+// shadow only moved at the END of the poll. One TX-heavy drain pass ran
+// long enough for the driver's TXDN handler to see its ack never land:
+// stale TXDN -> "another send finished" -> kick TXP -> re-read -> stale
+// TXDN -> ... at full 68020 speed. That flood kept stash_count from ever
+// reaching zero (the old loop here was unbounded), so push_state() never
+// ran, so the shadow stayed stale: a stable livelock that also starved
+// the RX pump, the stats writer, and every other Main service (the
+// "capture dead" wedge). Publishing after each apply means the guest's
+// next shadow read reflects its own ack within one apply latency - the
+// spin physically cannot sustain; the budget keeps a burst from starving
+// the rest of the poll even before the publish lands.
+#define DRAIN_BUDGET 256
 static void drain_ring(void)
 {
 	ring_slurp();
-	while (stash_count) {
+	int budget = DRAIN_BUDGET;
+	while (stash_count && budget--) {
 		uint64_t e = ring_stash[stash_head];
 		stash_head = (stash_head + 1) % STASH_DEPTH;
 		stash_count--;
@@ -404,7 +422,9 @@ static void drain_ring(void)
 			break;
 		case ETH_TAG_RESET:  sonic_reset(); break;
 		}
+		push_state();
 	}
+	if (stash_count) st.drain_full++;
 }
 
 // ── lifecycle ───────────────────────────────────────────────────────────
@@ -666,6 +686,7 @@ void mac_eth_poll(void)
 			fprintf(f, "rx_held    %llu  max_depth %llu\n",
 			        (unsigned long long)st.rx_held, (unsigned long long)st.rx_held_max);
 			fprintf(f, "rx_jumbo   %llu\n", (unsigned long long)st.rx_jumbo);
+			fprintf(f, "drain_full %llu\n", (unsigned long long)st.drain_full);
 			fprintf(f, "rx_ours    %llu  bytes %llu\n",
 			        (unsigned long long)st.rx_ours, (unsigned long long)st.rx_ours_bytes);
 			fprintf(f, "arp        rx %llu  tx %llu\n",
