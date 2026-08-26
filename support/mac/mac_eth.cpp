@@ -126,6 +126,8 @@ static void load_config(void)
 // ── DMA-RPC client (the SONIC model's guest-memory backend) ─────────────
 #define DMA_SPIN_US 1500   // busy-wait budget before falling back to usleep
 
+static void ring_slurp(void);   // defined with the doorbell ring below
+
 // SONIC register indices + bits we watch (values from mac_sonic.cpp).
 #define SONIC_CR        0x00
 #define SONIC_IMR       0x04
@@ -163,6 +165,10 @@ static int dma_rpc(uint32_t gaddr, uint32_t len, int wr)
 	for (;;) {
 		uint64_t s = *w64(ETH_OFF_DMASTAT);
 		if ((s & 0xff) == dma_seq) { rc = (s & 0x100) ? -1 : 0; break; }
+		// Keep the doorbell ring draining while we wait (stash only, no
+		// apply): if it backs up, the FPGA throttles the guest bus and
+		// cpu_waiting blocks the very DMA dispatch this RPC needs.
+		ring_slurp();
 		el = now_us() - t0;
 		// Patience budget: the engine can genuinely need tens of ms - its
 		// dispatch yields to every guest bus cycle (cpu_waiting) and every
@@ -334,9 +340,26 @@ static void push_state(void)
 }
 
 // ── doorbell ring ───────────────────────────────────────────────────────
-static void drain_ring(void)
+// Consuming the ring and APPLYING its entries are split on purpose. The
+// FPGA throttles the guest bus when the ring backs up ~200 entries: a guest
+// register WRITE then parks its bus cycle (cpu_waiting) for up to ~2 ms,
+// and cpu_waiting blocks every DMA dispatch. dma_rpc() used to spin without
+// consuming the ring, so under an RX-interrupt flood the circle closed -
+// Main waited on DMA, DMA waited on the guest bus, the bus waited on ring
+// space, ring space waited on Main - until the RPC "timed out", the
+// transmit aborted, and the desynced driver wedged the guest (2026-08-26
+// upload stall, ring_ovf 52). ring_slurp() only moves entries into a local
+// stash and publishes RPTR (no model calls - safe inside a pending host
+// op); drain_ring() applies the stash, which may re-enter the model (a CR
+// write can run a whole transmit chain) and so only runs from the poll.
+#define STASH_DEPTH 1024
+static uint64_t ring_stash[STASH_DEPTH];
+static int stash_head, stash_count;
+
+static void ring_slurp(void)
 {
 	uint32_t wp = (uint32_t)*w64(ETH_OFF_WPTR);
+	if (wp == rptr) return;
 	if (wp < rptr) {
 		printf("mac_eth: wptr regressed (%u < %u) — FPGA reset, resync\n", wp, rptr);
 		rptr = 0;
@@ -353,6 +376,21 @@ static void drain_ring(void)
 	while (rptr != wp && guard--) {
 		uint64_t e = *w64(ETH_OFF_RING + 8 * (rptr & (ETH_RING_ENTRIES - 1)));
 		rptr++;
+		if (stash_count < STASH_DEPTH)
+			ring_stash[(stash_head + stash_count++) % STASH_DEPTH] = e;
+		else
+			st.ring_ovf++;   // stash full: a multi-second stall, writes lost
+	}
+	*w64(ETH_OFF_RPTR) = rptr;   // release the guest-bus throttle
+}
+
+static void drain_ring(void)
+{
+	ring_slurp();
+	while (stash_count) {
+		uint64_t e = ring_stash[stash_head];
+		stash_head = (stash_head + 1) % STASH_DEPTH;
+		stash_count--;
 		if (!(e & 1)) continue;
 		int tag  = (int)(e >> 1) & 7;
 		int r    = (int)(e >> 4) & 0x3f;
@@ -366,7 +404,6 @@ static void drain_ring(void)
 		case ETH_TAG_RESET:  sonic_reset(); break;
 		}
 	}
-	*w64(ETH_OFF_RPTR) = rptr;
 }
 
 // ── lifecycle ───────────────────────────────────────────────────────────
@@ -401,6 +438,7 @@ static void card_start(void)
 
 	rptr = (uint32_t)*w64(ETH_OFF_WPTR);   // skip anything stale
 	*w64(ETH_OFF_RPTR) = rptr;             // release ring backpressure
+	stash_head = stash_count = 0;          // stale stashed writes die with the session
 	dma_seq = 0;
 	*w64(ETH_OFF_DMACMD)  = 0;             // engine reset state: seq 0 done
 	*w64(ETH_OFF_DMASTAT) = 0;
