@@ -361,6 +361,38 @@ int main()
 	check(last_tx_len == 1514, "max-size TX: exactly 1514 on the wire (no FCS overshoot)");
 	check(memcmp(last_tx, ram + 0x49000, 1514) == 0, "max-size TX: payload intact");
 
+	// ── chain budget: a long walk suspends and resumes ───────────────
+	// The guest appends descriptors while the chain runs (dynamic append),
+	// so an unbounded synchronous walk can run for seconds - during which
+	// no other register write gets applied and the write stash overflows
+	// (3,459 ISR acks lost, guest wedged - 2026-08-26 upload stall #3).
+	// The chain must stop after TX_CHAIN_BUDGET packets with CR.TXP still
+	// set and resume via sonic_tx_continue().
+	sonic_reg_write(ISR, 0x0200);
+	for (int i = 0; i < 10; i++) {
+		uint32_t d = 0x4C000 + i * 0x20;
+		wrw(d + 1 * 2, 0x0000);            // config
+		wrw(d + 2 * 2, TLEN);              // TPS
+		wrw(d + 3 * 2, 1);                 // TFC
+		wrw(d + 4 * 2, 0x7000);            // TSA0 -> $47000
+		wrw(d + 5 * 2, 0x0004);            // TSA1
+		wrw(d + 6 * 2, TLEN);              // TFS
+		wrw(d + 7 * 2, (uint16_t)(i == 9 ? 0xC001 : (0xC000 + (i + 1) * 0x20)));
+	}
+	sonic_reg_write(CTDA, 0xC000);
+	tx_count = 0;
+	sonic_reg_write(CR, 0x0002);           // TXP: walks 8 of the 10, then yields
+	check(tx_count == 8, "chain budget: 8 packets per invocation");
+	check(sonic_reg(CR) & 0x0002, "chain budget: CR.TXP still set while suspended");
+	check(!(sonic_reg(ISR) & 0x0200), "chain budget: no TXDN while suspended");
+	sonic_tx_continue();
+	check(tx_count == 10, "chain budget: continue delivers the rest");
+	check(!(sonic_reg(CR) & 0x0002), "chain budget: TXP clear at end of list");
+	check(sonic_reg(ISR) & 0x0200, "chain budget: TXDN set at end of list");
+	sonic_tx_continue();
+	check(tx_count == 10, "chain budget: continue is a no-op when idle");
+	sonic_reg_write(ISR, 0x0200);
+
 	// RX with a dirty receive-buffer pointer: stores at the masked address,
 	// but the REGISTER advance and the published packet pointer keep the
 	// driver's top byte like real silicon (only the bus is 24-bit).

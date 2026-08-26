@@ -564,6 +564,9 @@ void mac_eth_poll(void)
 	if (!card_up) return;
 
 	drain_ring();
+	// a transmit chain that hit its packet budget resumes here, now that
+	// the guest's queued register writes (ISR acks above all) are applied
+	sonic_tx_continue();
 
 	// Elasticity buffer: while the guest's RX ring is exhausted (RDE/RBE
 	// latched, or CRDA parked on an odd end-of-list link) the model refuses

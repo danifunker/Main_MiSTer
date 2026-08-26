@@ -40,6 +40,10 @@ int      sonic_int_line(void);                 // level: ISR & IMR & 0x7fff
 // free descriptor): the caller may hold the frame and retry once the guest
 // services its ring - dropping it instead costs a TCP retransmit timeout.
 int      sonic_rx_frame(const uint8_t *frame, int len);
+// Resume a transmit chain that hit its per-call packet budget (CR.TXP still
+// set). Call from the service poll after applying pending register writes;
+// a no-op when no chain is suspended.
+void     sonic_tx_continue(void);
 uint32_t sonic_ea_stripped(void);              // dirty-top-byte addrs masked (24-bit-mode witness)
 
 #endif

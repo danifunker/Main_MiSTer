@@ -339,11 +339,23 @@ int sonic_rx_frame(const uint8_t *frame, int len)
 }
 
 // ── transmit ────────────────────────────────────────────────────────────
+// Bounded per invocation: the guest driver APPENDS descriptors while the
+// chain runs (SONIC dynamic append), so a busy sender can keep the walk
+// alive indefinitely - and this port is synchronous, called from the apply
+// path, so an unbounded walk starves every other register write. The write
+// stash (1024) overflowed in seconds that way (3,459 ISR acks lost, model
+// desynced, guest TCP wedged - 2026-08-26 upload stall #3). Real silicon
+// transmits concurrently with register writes; approximate that at packet
+// granularity: up to TX_CHAIN_BUDGET packets per call, then return with
+// CR.TXP still set (the dynamic-append guard swallows redundant kicks) and
+// let sonic_tx_continue() resume from the poll after the stash has been
+// applied.
+#define TX_CHAIN_BUDGET 8
 static void transmit_chain(void)
 {
 	// synchronous port of MAME transmit() + send_complete_cb(), looping the
 	// descriptor chain until end-of-list or HTX
-	for (;;) {
+	for (int pkts = 0; pkts < TX_CHAIN_BUDGET; pkts++) {
 		const int w = WIDTH();
 		reg[TTDA] = reg[CTDA];
 		uint32_t const tda = DA(reg[UTDA], reg[CTDA]);
@@ -432,6 +444,15 @@ static void transmit_chain(void)
 		}
 		// else: chain to the next packet
 	}
+	// budget exhausted with the chain still live: CR.TXP stays set and
+	// sonic_tx_continue() picks the walk up from CTDA on the next poll
+}
+
+// Resume a budget-suspended transmit chain (call from the service poll,
+// AFTER pending register writes have been applied - never re-entrantly).
+void sonic_tx_continue(void)
+{
+	if ((reg[CR] & (CR_TXP | CR_RST)) == CR_TXP) transmit_chain();
 }
 
 // ── command / register writes ───────────────────────────────────────────
