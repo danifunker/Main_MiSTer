@@ -74,6 +74,17 @@ static uint16_t rdw(uint32_t ga) { uint16_t v; rd_words(ga, &v, 1, 2); return v;
 static void     wrw(uint32_t ga, uint16_t v) { wr_words(ga, &v, 1, 2); }
 
 static int fails;
+// Ack helper: production pushes shadows on every poll and after every
+// applied doorbell entry, so the guest only ever acks bits it has SEEN
+// (sonic_fill_shadows arms the ack clamp). Mirror that here: push, then
+// write. The ack-clamp test at the end is the one place that deliberately
+// writes without pushing.
+static void ack(uint16_t bits)
+{
+	uint16_t shad_[64];
+	sonic_fill_shadows(shad_);
+	sonic_reg_write(5, bits);
+}
 static void check(int cond, const char *name)
 {
 	printf("%s: %s\n", cond ? "pass" : "FAIL", name);
@@ -117,7 +128,7 @@ int main()
 	check(sonic_reg(CDC) == 0, "LCAM consumed the descriptor count");
 	check(sonic_reg(CE) == 1, "LCAM read the CAM enable word");
 	check(sonic_reg(ISR) & 0x1000, "LCAM set ISR_LCD");
-	sonic_reg_write(ISR, 0x1000);    // clear it
+	ack(0x1000);    // clear it
 
 	// ── RRA ──────────────────────────────────────────────────────────
 	// two resources at URRA:RSA (consuming the LAST one sets RBE and the
@@ -175,7 +186,7 @@ int main()
 	uint8_t other[60];
 	memcpy(other, frame, 60);
 	other[5] ^= 0xff;
-	sonic_reg_write(ISR, 0x0400);
+	ack(0x0400);
 	sonic_rx_frame(other, 60);
 	check(!(sonic_reg(ISR) & 0x0400), "unknown unicast filtered by CAM");
 
@@ -185,7 +196,7 @@ int main()
 	check(sonic_reg(ISR) & 0x0400, "broadcast accepted (BRD)");
 	check(rdw(0x43100) & 0x0080, "RDA status has BC for broadcast");
 	check(sonic_reg(ISR) & 0x0040, "end-of-list link set ISR_RDE");
-	sonic_reg_write(ISR, 0x0440);
+	ack(0x0440);
 
 	// ── transmit ─────────────────────────────────────────────────────
 	// TDA at UTDA:$5000: status, config, TPS, TFC=1, {TSA0,TSA1,TFS}, link
@@ -209,7 +220,7 @@ int main()
 	check(rdw(0x45000) & 0x0001, "TX status written back with PTX");
 	check(sonic_reg(ISR) & 0x0200, "end-of-list set ISR_TXDN");
 	check(!(sonic_reg(CR) & 0x0002), "CR TXP self-cleared");
-	sonic_reg_write(ISR, 0x0200);
+	ack(0x0200);
 
 	// ── loopback short-circuits into the receive path ────────────────
 	// fresh descriptor at $3200 (the previous list hit end-of-list)
@@ -218,12 +229,13 @@ int main()
 	wrw(0x43200 + 6 * 2, 0xffff);
 	sonic_reg_write(RCR, 0x0200);    // LB mode (MAC loopback), BRD off
 	sonic_reg_write(CTDA, 0x5000);   // reuse the same TDA
+	wrw(0x45000, 0);                 // rebuild: the driver zeroes status per send
 	memcpy(ram + 0x47000, frame, 60);   // dst = our CAM MAC
 	wrw(0x45000 + 2 * 2, 60);
 	wrw(0x45000 + 6 * 2, 60);
 	wrw(0x45000 + 7 * 2, 0x5201);    // link: end of list again
 	tx_count = 0;
-	sonic_reg_write(ISR, 0x0400);
+	ack(0x0400);
 	sonic_reg_write(CR, 0x0002);     // TXP
 	check(tx_count == 0, "loopback frame did not reach the wire");
 	check(sonic_reg(ISR) & 0x0400, "loopback frame received (PKTRX)");
@@ -250,7 +262,7 @@ int main()
 	for (int i = 0; i < TLEN; i++) ram[0x47000 + i] = (uint8_t)(0xC0 + i);
 	sonic_reg_write(RCR, 0x0000);          // wire mode (clears the loopback LB bits)
 	tx_count = 0;
-	sonic_reg_write(ISR, 0x0200);          // clear any stale TXDN
+	ack(0x0200);          // clear any stale TXDN
 	sonic_reg_write(CR, 0x0002);           // TXP with CTDA odd
 	check(tx_count == 1, "odd-EOL CTDA: TXP transmitted (word-aligned fetch, no wedge)");
 	check(last_tx_len == TLEN, "odd-EOL CTDA: wire frame without software FCS");
@@ -258,13 +270,13 @@ int main()
 	check(!(sonic_reg(CR) & 0x0002), "odd-EOL CTDA: CR.TXP self-cleared (releases the guest TXP-poll)");
 	check(sonic_reg(ISR) & 0x0200, "odd-EOL CTDA: ISR_TXDN set");
 	check(backend_odd == 0, "odd-EOL CTDA: no odd descriptor address reached the backend");
-	sonic_reg_write(ISR, 0x0200);
+	ack(0x0200);
 
 	// ── ISR write-1-clear and IMR gating of the int line ─────────────
 	check(sonic_reg(ISR) & 0x0400, "ISR bit set before clear");
 	sonic_reg_write(IMR, 0x0400);
 	check(sonic_int_line(), "int line high when ISR & IMR");
-	sonic_reg_write(ISR, 0x0400);
+	ack(0x0400);
 	check(!(sonic_reg(ISR) & 0x0400), "ISR write-1-clear");
 	check(!sonic_int_line(), "int line low after the clear");
 
@@ -277,7 +289,7 @@ int main()
 	// read. Publishing first let the driver rewrite the link under our
 	// pending read: CRDA left the ring and the guest hard-froze in a
 	// link=0 self-orbit (HW post-mortem 2026-08-23).
-	sonic_reg_write(ISR, 0x0040);    // clear RDE left by the end-of-list test
+	ack(0x0040);    // clear RDE left by the end-of-list test
 	sonic_reg_write(RCR, 0x2000);    // BRD back on (loopback test turned it off)
 	sonic_reg_write(CRDA, 0xA000);   // fresh descriptor at $4A000
 	wrw(0x4A00a, 0xA011);            // link: odd = end of list after one packet
@@ -313,7 +325,7 @@ int main()
 	// ip tx 0) was the exact 2026-08-26 HW fingerprint on a fresh 7.5.5.
 	uint32_t eas0 = sonic_ea_stripped();
 	backend_oob = 0;
-	sonic_reg_write(ISR, 0x0640);          // clear TXDN + PKTRX + RDE
+	ack(0x0640);          // clear TXDN + PKTRX + RDE
 	sonic_reg_write(UTDA, 0x8004);         // dirty upper half: locked flag set
 	sonic_reg_write(CTDA, 0x8000);         // descriptor true address $48000
 	wrw(0x48000 + 1 * 2, 0x0000);          // config
@@ -345,7 +357,7 @@ int main()
 	// socket refuses anything past MTU 1500 + 14 header with EMSGSIZE - so
 	// every full-size TX frame silently died while smaller ones passed:
 	// bulk uploads stalled at MacTCP's RTO cadence (2026-08-26).
-	sonic_reg_write(ISR, 0x0200);
+	ack(0x0200);
 	sonic_reg_write(CTDA, 0x8800);         // fresh TDA at true $48800
 	wrw(0x48800 + 1 * 2, 0x0000);          // config
 	wrw(0x48800 + 2 * 2, 1514);            // TPS
@@ -368,7 +380,7 @@ int main()
 	// (3,459 ISR acks lost, guest wedged - 2026-08-26 upload stall #3).
 	// The chain must stop after TX_CHAIN_BUDGET packets with CR.TXP still
 	// set and resume via sonic_tx_continue().
-	sonic_reg_write(ISR, 0x0200);
+	ack(0x0200);
 	for (int i = 0; i < 10; i++) {
 		uint32_t d = 0x4C000 + i * 0x20;
 		wrw(d + 1 * 2, 0x0000);            // config
@@ -391,12 +403,12 @@ int main()
 	check(sonic_reg(ISR) & 0x0200, "chain budget: TXDN set at end of list");
 	sonic_tx_continue();
 	check(tx_count == 10, "chain budget: continue is a no-op when idle");
-	sonic_reg_write(ISR, 0x0200);
+	ack(0x0200);
 
 	// RX with a dirty receive-buffer pointer: stores at the masked address,
 	// but the REGISTER advance and the published packet pointer keep the
 	// driver's top byte like real silicon (only the bus is 24-bit).
-	sonic_reg_write(ISR, 0x0640);          // clear TXDN + PKTRX + RDE
+	ack(0x0640);          // clear TXDN + PKTRX + RDE
 	sonic_reg_write(CRDA, 0xB000);         // fresh descriptor at $4B000
 	wrw(0x4B00a, 0xB011);                  // link: odd = end of list after one
 	wrw(0x4B00c, 0xffff);                  // in-use
@@ -422,7 +434,7 @@ int main()
 	// retransmit = the 2-4 KB/s FTP crawl measured 2026-08-26).
 	check(sonic_reg(ISR) & 0x0040, "rx-contract: RDE latched by the previous test");
 	check(sonic_rx_frame(other, 60) == -1, "rx-contract: RDE latched -> -1 (retryable)");
-	sonic_reg_write(ISR, 0x0440);          // clear PKTRX + RDE; CRDA still odd EOL
+	ack(0x0440);          // clear PKTRX + RDE; CRDA still odd EOL
 	check(sonic_rx_frame(other, 60) == -1, "rx-contract: no free descriptor -> -1 (retryable)");
 	wrw(0x4B00a, 0xB100);                  // driver appends: link now points to a fresh RDA
 	wrw(0x4B10a, 0xB111);                  // its link: odd = end of list
@@ -443,7 +455,7 @@ int main()
 	wrw(0x4B10a, 0xB200);
 	wrw(0x4B20a, 0xB211);
 	wrw(0x4B20c, 0xffff);
-	sonic_reg_write(ISR, 0x0440);
+	ack(0x0440);
 	uint8_t wrongdst[60];
 	memcpy(wrongdst, frame, 60);
 	wrongdst[5] ^= 0xff;                   // unknown unicast: CAM rejects
@@ -467,13 +479,13 @@ int main()
 	sonic_time_tick(3500);                 // total 4.5 ms
 	check(sonic_reg(5) & 0x0080, "watchdog: TC fired on expiry");
 	check(sonic_int_line(), "watchdog: TC raises the int line via IMR");
-	sonic_reg_write(5, 0x0080);            // ack TC
+	ack(0x0080);            // ack TC
 	sonic_time_tick(10000);
 	check(!(sonic_reg(5) & 0x0080), "watchdog: no refire until re-armed");
 	sonic_reg_write(WT0r, 0x0010);         // re-arm tiny
 	sonic_time_tick(100);
 	check(sonic_reg(5) & 0x0080, "watchdog: fires again after re-arm");
-	sonic_reg_write(5, 0x7fff);            // clean slate for the protocol test
+	ack(0x7fff);            // clean slate for the protocol test
 
 	// ── the Apple driver's recycle protocol vs the parked ring ───────
 	// Faithful port of the .ENET 1.0.7 descriptor management (disassembled
@@ -521,7 +533,7 @@ int main()
 			while (sonic_int_line() && guard--) {
 				uint16_t isr = sonic_reg(ISR);
 				if (isr & 0x0400) {
-					sonic_reg_write(ISR, 0x0400);
+					ack(0x0400);
 					// deferred drain at the top of the RX pass ($17a4),
 					// still gated on in_use == 0
 					for (int i = 0; i < ndef; ) {
@@ -541,7 +553,7 @@ int main()
 					}
 					continue;
 				}
-				if (isr & 0x0200) { sonic_reg_write(ISR, 0x0200); continue; }
+				if (isr & 0x0200) { ack(0x0200); continue; }
 				uint16_t rest = (uint16_t)(isr & 0x66F1 & ~0x0600);
 				if (!rest) break;
 				for (int b = 15; b >= 0; b--)
@@ -583,6 +595,78 @@ int main()
 		check(parks_seen >= 3, "driver-protocol: the ring parked repeatedly (reload path exercised)");
 		check(ndef_max >= 1, "driver-protocol: parked descriptor took the deferred path (in_use gate)");
 		check(consumed == NFRAMES, "driver-protocol: guest consumed every frame");
+	}
+
+	// ── ring-lap guard: one kick never revisits a descriptor ─────────
+	// The driver's TX descriptors form a ring; only the software tail's
+	// EOL link stops the chip. Our slow async walk can catch the ring in
+	// a transient zero-EOL window (mid-recycle) and LAP it - watched on
+	// the wire as six duplicate TCP segments in 6 ms followed by an
+	// oversize abort from a descriptor read mid-rebuild (2026-08-27
+	// upload stall). A revisit must end the chain exactly like EOL.
+	{
+		ack(0x0200);                       // clear stale TXDN
+		uint32_t p0 = sonic_txd.pkts, l0 = sonic_txd.laps;
+		const int TL = 70;
+		for (int i = 0; i < 3; i++) {
+			uint32_t d = 0x4E000 + i * 0x20;
+			wrw(d + 1 * 2, 0x0000);        // config
+			wrw(d + 2 * 2, TL);            // TPS
+			wrw(d + 3 * 2, 1);             // TFC
+			wrw(d + 4 * 2, 0x7000);        // TSA0 -> $47000
+			wrw(d + 5 * 2, 0x0004);        // TSA1
+			wrw(d + 6 * 2, TL);            // TFS
+			// link: CIRCULAR, no EOL anywhere (the hazard window)
+			wrw(d + 7 * 2, (uint16_t)(0xE000 + ((i + 1) % 3) * 0x20));
+		}
+		sonic_reg_write(CTDA, 0xE000);
+		tx_count = 0;
+		sonic_reg_write(CR, 0x0002);       // TXP into the endless ring
+		check(sonic_txd.pkts - p0 == 3, "ring-lap: exactly one pass (3 sends, no dups)");
+		check(sonic_txd.laps - l0 == 1, "ring-lap: the revisit was witnessed");
+		check(!(sonic_reg(CR) & 0x0002), "ring-lap: TXP self-cleared (ends like EOL)");
+		check(sonic_reg(ISR) & 0x0200, "ring-lap: TXDN raised");
+		check(sonic_reg(CTDA) & 1, "ring-lap: CTDA parked odd on the revisited link");
+		// a FRESH kick may legally send the same descriptors again
+		// (in-place rebuild protocol: the driver zeroes status per rebuild)
+		ack(0x0200);
+		for (int i = 0; i < 3; i++) wrw(0x4E000 + i * 0x20, 0);
+		sonic_reg_write(CR, 0x0002);
+		check(sonic_txd.pkts - p0 == 6, "ring-lap: fresh kick walks the ring once more");
+		ack(0x0200);
+	}
+
+	// ── ack clamp: only PUSHED bits are clearable ────────────────────
+	// The guest composes its ISR ack from a shadow read; the ack applies
+	// ~ms later. A bit set in between (a second TXDN) must SURVIVE the
+	// ack or its interrupt is lost forever - the driver's TXDN walker
+	// never re-runs and its send queue jams (the 2026-08-26 upload
+	// freeze at ~8KB). Clearing is gated on the bit having been pushed
+	// (sonic_fill_shadows) since it last cleared.
+	{
+		uint16_t shad[64];
+		ack(0x7fff);                       // clean slate
+		sonic_reg_write(0, 0x0020);        // ST
+		sonic_reg_write(0x29, 0x0100);     // WT0: 256 counts
+		sonic_reg_write(0x2A, 0x0000);
+		sonic_time_tick(100);              // TC fires
+		check(sonic_reg(5) & 0x0080, "ack-clamp: TC set");
+		sonic_fill_shadows(shad);          // push: guest sees TC
+		sonic_reg_write(5, 0x0080);        // first ack: clears (seen)
+		check(!(sonic_reg(5) & 0x0080), "ack-clamp: seen bit clears");
+		sonic_reg_write(0x29, 0x0100);     // re-arm; a SECOND event fires
+		sonic_time_tick(100);              // ...with NO push in between
+		// the guest's duplicate/late ack - composed against the OLD read -
+		// applies now; the fresh unseen event must survive it
+		sonic_reg_write(5, 0x0080);
+		check(sonic_reg(5) & 0x0080, "ack-clamp: unseen re-fire SURVIVES a late ack");
+		check(sonic_int_line(), "ack-clamp: its interrupt stays pending");
+		sonic_fill_shadows(shad);          // push the surviving bit
+		sonic_reg_write(5, 0x0080);
+		check(!(sonic_reg(5) & 0x0080), "ack-clamp: clears once pushed");
+		// blind clear of an already-clear bit stays a harmless no-op
+		sonic_reg_write(5, 0x0200);
+		check(!(sonic_reg(5) & 0x0200), "ack-clamp: blind clear of a clear bit is a no-op");
 	}
 
 	printf(fails ? "%d FAILURES (mac_sonic_test)\n" : "ALL PASS (mac_sonic_test)\n", fails);

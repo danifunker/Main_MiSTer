@@ -49,5 +49,12 @@ void     sonic_tx_continue(void);
 // timeout/recovery paths). Call from the service poll.
 void     sonic_time_tick(unsigned us);
 uint32_t sonic_ea_stripped(void);              // dirty-top-byte addrs masked (24-bit-mode witness)
+// TX-path witnesses (counters only; see the block above transmit_chain)
+typedef struct {
+	uint32_t chains, pkts, ends_eol, aborts, oversize, laps, busy_stop;
+	uint32_t kicks_even, kicks_odd, kicks_swallowed;
+	uint16_t last_ctda;
+} sonic_tx_debug_t;
+extern sonic_tx_debug_t sonic_txd;
 
 #endif

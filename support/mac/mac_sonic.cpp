@@ -90,6 +90,7 @@ static const uint16_t regmask[64] = {
 static const sonic_host_ops *host;
 static uint16_t reg[64];
 static uint64_t cam[16];
+static uint16_t isr_seen;   // ack-clearable ISR bits; see sonic_fill_shadows
 
 // Bus effective address. The LC PDS exposes 24 address lines, so the real
 // card's DMA only ever drives A0-A23: whatever the driver leaves in the top
@@ -129,13 +130,29 @@ uint32_t sonic_ea_stripped(void) { return ea_stripped_cnt; }
 // pointers — CRBA, TSA — are NOT descriptor pointers and keep EA().)
 #define DA(hi, lo) (EA(hi, lo) & ~(uint32_t)1)
 
-// A host-op failure anywhere in the transmit chain must still release the
-// guest: leaving CR.TXP set wedges any driver that polls TXP or waits on the
-// TXDN interrupt. Mirror normal completion (clear TXP, raise TXDN) so a failed
-// transmit is a recoverable error, never a boot-time wedge. (With the DA()
-// word-align above, descriptor fetches no longer fail on the odd-EOL address;
-// this stays as a backstop for genuine out-of-range/host errors.)
-#define TX_ABORT() do { reg[CR] &= (uint16_t)~CR_TXP; reg[ISR] |= ISR_TXDN; return; } while (0)
+// TX-path witnesses: every silent exit gets a counter, so a "the guest
+// stopped sending" stall can be split between the model and the guest with
+// one look at /tmp/mac_eth_stats (2026-08-26: MacTCP waited forever on a
+// send completion; nothing said whether the chain aborted, the kick was
+// swallowed, or the driver never kicked).
+sonic_tx_debug_t sonic_txd;
+
+// Any chain exit that is not a completed send PARKS on the descriptor it was
+// reading: CTDA is restored to that descriptor's address with the EOL bit,
+// TXP clears and TXDN raises exactly as at end-of-list, and the guest's next
+// kick RE-READS the descriptor from its start. The old TX_ABORT advanced
+// past the header words it had consumed, so one bad walk left CTDA pointing
+// MID-DESCRIPTOR and every later kick gathered garbage from a misaligned
+// ring - the permanently dead pipeline behind the 2026-08-27 upload stall
+// (ovs=1 then silence). Parking makes every stop recoverable: the driver
+// keeps kicking (its own retry paths), and a re-read of a by-then-finished
+// descriptor proceeds normally.
+#define TX_PARK(ttda) do { \
+	reg[CTDA] = (uint16_t)((ttda) | 1); \
+	reg[CR]  &= (uint16_t)~CR_TXP; \
+	reg[ISR] |= ISR_TXDN; \
+	return; } while (0)
+#define TX_ABORT() do { sonic_txd.aborts++; TX_PARK(reg[TTDA]); } while (0)
 
 // ── ethernet CRC32 (reflected, poly 0xEDB88320), FCS byte order LE ──────
 static uint32_t crc32_eth(const uint8_t *p, int n)
@@ -159,6 +176,9 @@ void sonic_init(const sonic_host_ops *ops)
 
 void sonic_reset(void)
 {
+	// permissive until the first pushes cycle: before the host publishes
+	// shadows the guest cannot be reacting to unseen bits anyway
+	isr_seen  = 0xFFFF;
 	reg[CR]   = CR_RST | CR_STP | CR_RXDIS;
 	reg[DCR] &= (uint16_t)~(DCR_EXBUS | DCR_LBR);
 	reg[RCR] &= (uint16_t)~(RCR_RNT | RCR_BRD | RCR_LB);
@@ -174,7 +194,25 @@ void sonic_reset(void)
 
 uint16_t sonic_reg(int r) { return reg[r & 0x3f]; }
 
-void sonic_fill_shadows(uint16_t out[64]) { memcpy(out, reg, sizeof reg); }
+// ISR bits the guest can legitimately acknowledge: only what has been
+// PUSHED to it (sonic_fill_shadows = the publish) since the bit last
+// cleared. On real silicon an ISR write-1-clear lands at a bus instant, so
+// a bit set AFTER it stays set. Here the guest composes its ack from a
+// shadow read and the ack applies milliseconds later - clearing a bit the
+// guest never saw. Watched on HW 2026-08-26: two transmit chains complete
+// close together, the ack meant for the first TXDN applies after the model
+// set the second, the completion interrupt is eaten, the driver's TXDN
+// walker never re-runs, and its send queue jams with the kick gated on a
+// walk that never comes - the bulk-upload 8KB freeze. Clamping the ack to
+// pushed-and-still-set bits makes the second TXDN survive and re-interrupt.
+// Blind clears of already-clear bits (driver-open writes ISR before
+// enabling anything) are naturally unaffected: clearing a clear bit is a
+// no-op whether or not it is "seen".
+void sonic_fill_shadows(uint16_t out[64])
+{
+	isr_seen |= reg[ISR];
+	memcpy(out, reg, sizeof reg);
+}
 
 int sonic_int_line(void) { return (reg[ISR] & reg[IMR] & 0x7fff) != 0; }
 
@@ -369,8 +407,34 @@ int sonic_rx_frame(const uint8_t *frame, int len)
 // let sonic_tx_continue() resume from the poll after the stash has been
 // applied.
 #define TX_CHAIN_BUDGET 8
+// One kick never revisits a descriptor. The driver's TX descriptors form a
+// RING (in-place rebuild, one EOL link at the software tail); real silicon
+// walks it at wire speed inside windows the driver's interrupts-off
+// critical sections make atomic, so it always meets the tail EOL. This
+// port's walk is minutes-of-bus-time slow and ASYNC to the guest, so it can
+// catch the ring in a transient zero-EOL state (mid-recycle) and LAP it:
+// watched on the wire 2026-08-27 as six identical TCP segments inside 6 ms
+// (a budget-of-8 chain re-sending stale descriptors) followed by an
+// oversize abort from a descriptor read mid-rebuild - the bulk-upload
+// stall. A revisit is protocol-impossible on real hardware, so treat it
+// exactly like end-of-list: stop, TXDN, park CTDA odd on the revisited
+// address. Reset per fresh TXP command; a budget suspend/resume keeps the
+// set (same chain).
+#define TX_SEEN_MAX 64
+static uint32_t tx_seen[TX_SEEN_MAX];
+static int      tx_nseen;
+void sonic_tx_new_chain(void) { tx_nseen = 0; }
+static int tx_revisited(uint32_t da)
+{
+	for (int i = 0; i < tx_nseen; i++)
+		if (tx_seen[i] == da) return 1;
+	if (tx_nseen < TX_SEEN_MAX) tx_seen[tx_nseen++] = da;
+	return tx_nseen >= TX_SEEN_MAX;   // set full: stop too (witnessed)
+}
 static void transmit_chain(void)
 {
+	sonic_txd.chains++;
+	sonic_txd.last_ctda = reg[CTDA];
 	// synchronous port of MAME transmit() + send_complete_cb(), looping the
 	// descriptor chain until end-of-list or HTX
 	for (int pkts = 0; pkts < TX_CHAIN_BUDGET; pkts++) {
@@ -379,12 +443,30 @@ static void transmit_chain(void)
 		uint32_t const tda = DA(reg[UTDA], reg[CTDA]);
 		unsigned word = 1;   // word 0 is the status slot
 
+		if (tx_revisited(tda)) {
+			sonic_txd.laps++;
+			TX_PARK(reg[CTDA]);
+		}
+
+		// status slot included in the same RPC: the driver's own convention
+		// is status == 0 <=> queued-and-unsent (its builder zeroes it, the
+		// chip writes nonzero completion, its walker writes FFFF when
+		// consumed). Nonzero here means this walk has run into a descriptor
+		// that is NOT a fresh send - completed awaiting recycle, or the far
+		// side of a transient zero-EOL window - which real silicon never
+		// reads because the driver's interrupts-off critical sections are
+		// atomic against its wire-speed walk. Park as if it were EOL; the
+		// guest's next kick re-reads it.
 		uint16_t const tcr_old = reg[TCR];
-		uint16_t hdr[3];
-		if (host->read_words(tda + 1 * w, hdr, 3, w)) TX_ABORT();
-		reg[TCR] = hdr[0] & TCR_TPC;
-		reg[TPS] = hdr[1];
-		reg[TFC] = hdr[2];
+		uint16_t hdr[4];
+		if (host->read_words(tda, hdr, 4, w)) TX_ABORT();
+		if (hdr[0] != 0) {
+			sonic_txd.busy_stop++;
+			TX_PARK(reg[CTDA]);
+		}
+		reg[TCR] = hdr[1] & TCR_TPC;
+		reg[TPS] = hdr[2];
+		reg[TFC] = hdr[3];
 		word += 3;
 
 		if ((reg[TCR] & TCR_PINT) && !(tcr_old & TCR_PINT))
@@ -401,7 +483,7 @@ static void transmit_chain(void)
 			reg[TFS]  = fr[2];
 			word += 3;
 
-			if (length + reg[TFS] > sizeof buf - 4) TX_ABORT();
+			if (length + reg[TFS] > sizeof buf - 4) { sonic_txd.oversize++; TX_ABORT(); }
 			if (host->read_bytes(EA(reg[TSA1], reg[TSA0]), buf + length, reg[TFS])) TX_ABORT();
 			length += reg[TFS];
 		}
@@ -438,6 +520,7 @@ static void transmit_chain(void)
 		}
 
 		// completion (MAME send_complete_cb, success path)
+		sonic_txd.pkts++;
 		reg[TCR] |= TCR_PTX;
 		uint16_t st = reg[TCR] & TCR_TPS_;
 		if (host->write_words(DA(reg[UTDA], reg[TTDA]), &st, 1, w)) TX_ABORT();
@@ -456,6 +539,7 @@ static void transmit_chain(void)
 		if (host->read_words(DA(reg[UTDA], reg[CTDA]), &link, 1, w)) TX_ABORT();
 		reg[CTDA] = link;
 		if (reg[CTDA] & 1) {
+			sonic_txd.ends_eol++;
 			reg[ISR] |= ISR_TXDN;
 			reg[CR]  &= (uint16_t)~CR_TXP;
 			return;
@@ -506,7 +590,7 @@ void sonic_time_tick(unsigned us)
 static void command(uint16_t param)
 {
 	if (param & CR_HTX)   reg[CR] &= (uint16_t)~CR_TXP;
-	if (param & CR_TXP) { reg[CR] &= (uint16_t)~CR_HTX; transmit_chain(); }
+	if (param & CR_TXP) { reg[CR] &= (uint16_t)~CR_HTX; sonic_tx_new_chain(); transmit_chain(); }
 	if (param & CR_RXDIS) reg[CR] &= (uint16_t)~CR_RXEN;
 	if (param & CR_RXEN)  reg[CR] &= (uint16_t)~CR_RXDIS;
 	if (param & CR_STP)   reg[CR] &= (uint16_t)~CR_ST;
@@ -531,6 +615,11 @@ void sonic_reg_write(int r, uint16_t data)
 			uint16_t cmd = data & regmask[r];
 			// dynamic TDA append (datasheet 3.5.4): a TXP while TXP is
 			// already running must not restart the engine
+			if (data & CR_TXP) {
+				if (reg[CR] & CR_TXP) sonic_txd.kicks_swallowed++;
+				else if (reg[CTDA] & 1) sonic_txd.kicks_odd++;
+				else sonic_txd.kicks_even++;
+			}
 			if (reg[CR] & CR_TXP) cmd &= (uint16_t)~CR_TXP;
 			reg[r] |= data & regmask[r];
 			command(cmd);
@@ -546,6 +635,11 @@ void sonic_reg_write(int r, uint16_t data)
 		break;
 
 	case ISR:
+		// the guest can only clear bits it has SEEN (see isr_seen above);
+		// a bit set since the last shadow push survives this ack and
+		// re-raises the interrupt line
+		data &= isr_seen;
+		isr_seen &= (uint16_t)~data;
 		// reload rra when RBE is cleared (MAME quirk, drivers rely on it)
 		if ((reg[r] & ISR_RBE) && (data & ISR_RBE))
 			read_rra(0);

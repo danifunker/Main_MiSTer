@@ -698,6 +698,10 @@ void mac_eth_poll(void)
 			for (int i = 0; i < 64; i++)
 				if (st.reg_wr[i]) fprintf(f, " %02X=%u", i, st.reg_wr[i]);
 			fprintf(f, "\n");
+			fprintf(f, "sonic_tx chains=%u pkts=%u eol=%u ab=%u ovs=%u laps=%u busy=%u ke=%u ko=%u ksw=%u ctda=%04X\n",
+			        sonic_txd.chains, sonic_txd.pkts, sonic_txd.ends_eol,
+			        sonic_txd.aborts, sonic_txd.oversize, sonic_txd.laps, sonic_txd.busy_stop, sonic_txd.kicks_even,
+			        sonic_txd.kicks_odd, sonic_txd.kicks_swallowed, sonic_txd.last_ctda);
 			fprintf(f, "sonic cr=%04X isr=%04X imr=%04X crda=%04X rrp=%04X rwp=%04X\n",
 			        sonic_reg(SONIC_CR), sonic_reg(SONIC_ISR), sonic_reg(SONIC_IMR),
 			        sonic_reg(SONIC_CRDA), sonic_reg(SONIC_RRP), sonic_reg(SONIC_RWP));
