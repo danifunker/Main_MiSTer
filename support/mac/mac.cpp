@@ -9,6 +9,7 @@
 #include "../../spi.h"
 #include "../../file_io.h"
 #include "mac.h"
+#include "mac_eth.h"
 
 static char is_core_named(const char *n)
 {
@@ -91,6 +92,9 @@ void mac_poll()
 		mac_cdrom_poll();   // one-shot boot repulse of the CD mount
 	}
 	else cdc_inited = 0;
+
+	// PDS Ethernet: mac_eth self-gates on an exact core-name match (MacLCII must not reach it).
+	mac_eth_poll();
 }
 
 int mac_cdda_window(int disk, uint32_t lba)
