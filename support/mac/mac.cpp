@@ -93,7 +93,7 @@ void mac_poll()
 	}
 	else cdc_inited = 0;
 
-	// PDS Ethernet: mac_eth self-gates on an exact core-name match (MacLCII must not reach it).
+	// Ethernet: mac_eth self-gates on exact core-name matches (MacLCII must not reach it).
 	mac_eth_poll();
 }
 
