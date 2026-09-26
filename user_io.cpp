@@ -287,9 +287,12 @@ char is_neogeo_cd() {
     return is_neogeo() && neocd_is_en();
 }
 
+// The NeXT cores: the mono NeXTcube core ("NeXT") and the NeXTstation Turbo
+// Color core ("NeXT-Color") share the HPS-side services (SCSI target responses,
+// UTC battery clock, Ethernet daemon, mount hooks).
 char is_next()
 {
-	return !strcasecmp(orig_name, "NeXT");
+	return !strcasecmp(orig_name, "NeXT") || !strcasecmp(orig_name, "NeXT-Color");
 }
 
 // Guests that read the battery clock as UTC and apply their own time zone
