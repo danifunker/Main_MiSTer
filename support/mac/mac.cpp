@@ -11,6 +11,7 @@
 #include "mac.h"
 #include "mac_eth.h"
 #include "mac_disk.h"
+#include "../sparc/sparc.h"
 
 static char is_core_named(const char *n)
 {
@@ -40,7 +41,8 @@ static int mac_cd_ok(void)      { return is_mac_scsi_family(); }
 static int mac_toolbox_ok(void) { return mac_cd_ok() && !is_core_named("macplus"); }
 
 int mac_toolbox_slot()    { return mac_toolbox_ok() ? MAC_TOOLBOX_SLOT    : -1; }
-int mac_cdrom_slot()      { return mac_cd_ok()      ? MAC_CDROM_SLOT      : -1; }
+// The SunSparcStation core's CD-ROM (slot 2) takes the same CUE/CHD translation.
+int mac_cdrom_slot()      { return is_sparc() ? SPARC_CDROM_SLOT : mac_cd_ok() ? MAC_CDROM_SLOT : -1; }
 int mac_cd_toolbox_slot() { return mac_toolbox_ok() ? MAC_CD_TOOLBOX_SLOT : -1; }
 
 // CD image translation on the CD-ROM slot: CUE/CHD/raw-2352 become a flat
@@ -120,7 +122,7 @@ int mac_sd_service(int disk, fileTYPE *f, int op, uint32_t lba, int sz, int ack)
 {
 	if (mac_disk_service(disk, f, op, lba, sz, ack)) return 1;
 
-	static uint8_t buf[4096];
+	static uint8_t buf[UIO_BUFFER_SIZE];
 	if (sz > (int)sizeof(buf)) return 0;
 
 	// Toolbox round-trip (file or CD-changer slot): op 2 = the CDB -> run the
@@ -177,7 +179,9 @@ int mac_sd_service(int disk, fileTYPE *f, int op, uint32_t lba, int sz, int ack)
 	{
 		if (op & 1)
 		{
-			mac_cdrom_fill(disk, lba, buf, sz);
+			// the SPARC core asks for up to 16 KB at a time; fill takes 4 KB
+			for (int pos = 0; pos < sz; pos += 4096)
+				mac_cdrom_fill(disk, lba + pos / 512, buf + pos, (sz - pos) < 4096 ? (sz - pos) : 4096);
 			EnableIO();
 			spi_w(UIO_SECTOR_RD | ack);
 			spi_block_write(buf, user_io_get_width(), sz);

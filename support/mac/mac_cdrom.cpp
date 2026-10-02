@@ -10,6 +10,7 @@
 #include "../../hardware.h"
 #include "../chd/mister_chd.h"
 #include "mac.h"
+#include "../sparc/sparc.h"
 #include "mac_cdrom_resp.h"
 #include "mac_cdrom_play.h"
 
@@ -387,7 +388,7 @@ int mac_cdrom_mount(int index, const char *name)
 	// Arm the boot repulse for HANDLED mounts; its own remount must not re-arm.
 	if (!rp_firing)
 	{
-		if (r == MAC_CDROM_HANDLED && name && *name && !is_mac_scsi_optimized())
+		if (r == MAC_CDROM_HANDLED && name && *name && !is_mac_scsi_optimized() && !is_sparc())
 		{
 			strncpy(rp_path, name, sizeof(rp_path) - 1);
 			rp_path[sizeof(rp_path) - 1] = 0;
