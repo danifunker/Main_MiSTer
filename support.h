@@ -20,6 +20,9 @@
 // Mac
 #include "support/mac/mac.h"
 
+// SunSparcStation
+#include "support/sparc/sparc.h"
+
 // Archie support
 #include "support/archie/archie.h"
 

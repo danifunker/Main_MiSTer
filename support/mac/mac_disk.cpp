@@ -1,4 +1,4 @@
-// Mac SCSI family hard disks: write buffer.
+// Mac SCSI family (and SunSparcStation) hard disks: write buffer.
 // Each O_SYNC write costs ~4 ms, so gather sectors into runs and write them out together.
 
 #include <stdint.h>
@@ -15,6 +15,7 @@
 #include "../../spi.h"
 #include "mac.h"
 #include "mac_disk.h"
+#include "../sparc/sparc.h"
 
 #define BLKSZ    512
 #define SLOTS    2
@@ -181,7 +182,7 @@ int mac_disk_service(int disk, fileTYPE *f, int op, uint64_t lba, int sz, int ac
 {
 	static uint8_t buf[UIO_BUFFER_SIZE];
 
-	if (disk < 0 || disk >= SLOTS || !op || !is_mac_scsi_family()) return 0;
+	if (disk < 0 || disk >= SLOTS || !op || !(is_mac_scsi_family() || is_sparc())) return 0;
 
 	uint64_t off = lba * BLKSZ;
 	if (op != 2)
