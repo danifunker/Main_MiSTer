@@ -22,6 +22,7 @@
 
 // SunSparcStation
 #include "support/sparc/sparc.h"
+#include "support/sparc/sparc_enet.h"
 
 // Archie support
 #include "support/archie/archie.h"

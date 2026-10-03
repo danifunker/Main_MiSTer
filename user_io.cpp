@@ -1465,6 +1465,7 @@ void user_io_init(const char *path, const char *xml)
 
 	// Same for the NeXT ethernet bridge.
 	next_enet_stop();
+	sparc_enet_stop();
 
 	// we need to set the directory to where the XML file (MRA) is
 	// not the RBF. The RBF will be in arcade, which the user shouldn't
@@ -1626,6 +1627,7 @@ void user_io_init(const char *path, const char *xml)
 				// a branch of the chain below, or the core skips the boot
 				// ROM load at its end and comes up with no ROM at all.
 				if (is_next()) next_enet_start();
+				if (is_sparc()) sparc_enet_start();
 
 				if (xml && isXmlName(xml) == 1)
 				{
@@ -3344,6 +3346,7 @@ void user_io_poll()
 	}
 
 	next_enet_poll();
+	sparc_enet_poll();
 
 	// The NeXT keeps a battery backed clock that the guest reads at
 	// boot; the one-shot update at core load is not enough if the core
