@@ -1,4 +1,4 @@
-// Mac SCSI family hard disks: write buffer.
+// Sun SCSI family hard disks (slots 0/1): write buffer, as the Mac family has.
 // Each O_SYNC write costs ~4 ms, so gather sectors into runs and write them out together.
 
 #include <stdint.h>
@@ -13,11 +13,11 @@
 #include "../../file_io.h"
 #include "../../user_io.h"
 #include "../../spi.h"
-#include "mac.h"
-#include "mac_disk.h"
+#include "sun.h"
+#include "sun_disk.h"
 
 #define BLKSZ    512
-#define SLOTS    2
+#define SLOTS    SUN_DISK_SLOTS
 #define RUN_MAX  (64 * 1024)
 #define RUNS     8
 #define IDLE_MS  20
@@ -62,7 +62,7 @@ static void flush_run(int disk, run *r)
 		ok = fd >= 0 && pwrite64(fd, r->data, len, r->off) == (ssize_t)len;
 		if (fd >= 0) close(fd);
 	}
-	if (!ok) printf("mac_disk: write %u @ %llu to %s failed\n", len, (unsigned long long)r->off, s->path);
+	if (!ok) printf("sun_disk: write %u @ %llu to %s failed\n", len, (unsigned long long)r->off, s->path);
 }
 
 static void flush_overlap(int disk, uint64_t off, uint64_t len, run *keep)
@@ -75,7 +75,7 @@ static void flush_overlap(int disk, uint64_t off, uint64_t len, run *keep)
 	}
 }
 
-void mac_disk_flush(int disk)
+void sun_disk_flush(int disk)
 {
 	if (disk < 0 || disk >= SLOTS) return;
 	while (slots[disk].pending)
@@ -90,7 +90,7 @@ void mac_disk_flush(int disk)
 	}
 }
 
-void mac_disk_poll()
+void sun_disk_poll()
 {
 	if (!pending) return;
 
@@ -101,7 +101,7 @@ void mac_disk_poll()
 		if (!s->pending) continue;
 		if (now - s->last >= IDLE_MS)
 		{
-			mac_disk_flush(d);
+			sun_disk_flush(d);
 			continue;
 		}
 		for (int i = 0; i < RUNS; i++)
@@ -177,11 +177,11 @@ static void stage(int disk, uint64_t off, const uint8_t *data, uint32_t sz)
 	if (free_r->len == RUN_MAX) flush_run(disk, free_r);
 }
 
-int mac_disk_service(int disk, fileTYPE *f, int op, uint64_t lba, int sz, int ack)
+int sun_disk_service(int disk, fileTYPE *f, int op, uint64_t lba, int sz, int ack)
 {
 	static uint8_t buf[UIO_BUFFER_SIZE];
 
-	if (disk < 0 || disk >= SLOTS || !op || !is_mac_scsi_family()) return 0;
+	if (disk < 0 || disk >= SLOTS || !op || !is_sun_scsi_family()) return 0;
 
 	uint64_t off = lba * BLKSZ;
 	if (op != 2)
@@ -193,7 +193,7 @@ int mac_disk_service(int disk, fileTYPE *f, int op, uint64_t lba, int sz, int ac
 
 	if (sz > (int)sizeof(buf) || !can_buffer(disk, f, off, sz))
 	{
-		mac_disk_flush(disk);
+		sun_disk_flush(disk);
 		return 0;
 	}
 

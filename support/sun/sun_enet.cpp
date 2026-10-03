@@ -1,4 +1,4 @@
-// Ethernet bridge for the SunSparcStation core -- see sparc_enet.h.
+// Ethernet bridge for the SunSparcStation core -- see sun_enet.h.
 //
 // DDR3 mailbox (ARM physical 0x1FF00000, the window the A2065 and the NeXT
 // use; one core runs at a time). 64-bit little-endian words; frame byte i
@@ -24,8 +24,7 @@
 
 #include "../../user_io.h"
 #include "../../shmem.h"
-#include "sparc.h"
-#include "sparc_enet.h"
+#include "sun_enet.h"
 
 // the host network layer of the A2065 module (the NeXT bridge uses it too)
 extern int  ethernet_open(const char *iface, int promiscuous);
@@ -62,7 +61,7 @@ extern void ethernet_offload_on(const char *iface);
 #define MODE_MACVLAN  3
 #define MODE_TAP      4
 
-#define MACVLAN_NAME  "sparc0"
+#define MACVLAN_NAME  "sun0"
 #define MAX_FRAME     (SB_SLOT - 8)
 
 static volatile uint8_t *mb = 0;
@@ -157,17 +156,17 @@ static void open_link(int mode)
 	uint8_t scratch[MAX_FRAME];
 	while (ethernet_recv_nb(scratch, MAX_FRAME) > 0) ;
 	if ((mode == MODE_ETH0 || mode == MODE_ETH1) && mac_known) ethernet_set_mac_filter(guest_mac);
-	printf("[sparc-enet] bridge up on %s (mode %d)\n", iface, mode);
+	printf("[sun-enet] bridge up on %s (mode %d)\n", iface, mode);
 }
 
-void sparc_enet_start(void)
+void sun_enet_start(void)
 {
 	if (!mb)
 	{
 		mb = (volatile uint8_t *)shmem_map(SB_BASE, SB_SIZE);
 		if (!mb)
 		{
-			printf("[sparc-enet] shmem_map failed\n");
+			printf("[sun-enet] shmem_map failed\n");
 			return;
 		}
 		// a stale magic from an earlier session must not look alive
@@ -183,26 +182,26 @@ void sparc_enet_start(void)
 	gen = ~0ULL;
 	mac_known = 0;
 	cur_mode = MODE_OFF;
-	printf("[sparc-enet] armed, waiting for the core's mailbox\n");
+	printf("[sun-enet] armed, waiting for the core's mailbox\n");
 }
 
-void sparc_enet_stop(void)
+void sun_enet_stop(void)
 {
 	if (!running) return;
 	running = 0;
 	close_link();
-	printf("[sparc-enet] stopped\n");
+	printf("[sun-enet] stopped\n");
 }
 
 static int mode_from_status(void)
 {
-	int mode = (int)user_io_status_get(SPARC_ENET_STATUS_OPT);
+	int mode = (int)user_io_status_get(SUN_ENET_STATUS_OPT);
 	if (mode < 0 || mode > MODE_TAP) mode = MODE_OFF;
 	if (!a2065_mode_available(mode)) mode = MODE_OFF;
 	return mode;
 }
 
-void sparc_enet_poll(void)
+void sun_enet_poll(void)
 {
 	static uint8_t frame[MAX_FRAME + 64];
 
@@ -215,7 +214,7 @@ void sparc_enet_poll(void)
 	{
 		gen = g;
 		mac_known = 0;
-		printf("[sparc-enet] core mailbox up (generation %08llX)\n", (unsigned long long)g);
+		printf("[sun-enet] core mailbox up (generation %08llX)\n", (unsigned long long)g);
 	}
 
 	uint8_t m[6];
@@ -223,7 +222,7 @@ void sparc_enet_poll(void)
 	{
 		memcpy(guest_mac, m, 6);
 		mac_known = 1;
-		printf("[sparc-enet] guest MAC %02X:%02X:%02X:%02X:%02X:%02X\n",
+		printf("[sun-enet] guest MAC %02X:%02X:%02X:%02X:%02X:%02X\n",
 		       m[0], m[1], m[2], m[3], m[4], m[5]);
 		if (link_open && (cur_mode == MODE_ETH0 || cur_mode == MODE_ETH1))
 			ethernet_set_mac_filter(guest_mac);

@@ -20,9 +20,9 @@
 // Mac
 #include "support/mac/mac.h"
 
-// SunSparcStation
-#include "support/sparc/sparc.h"
-#include "support/sparc/sparc_enet.h"
+// Sun SCSI family (SunSparcStation)
+#include "support/sun/sun.h"
+#include "support/sun/sun_enet.h"
 
 // Archie support
 #include "support/archie/archie.h"
