@@ -195,7 +195,10 @@ void sun_enet_stop(void)
 
 static int mode_from_status(void)
 {
-	int mode = (int)user_io_status_get(SUN_ENET_STATUS_OPT);
+	// The OSD lists eth0 first, so that it is the default (value 0), then
+	// Off; the other values are the modes' own (sun_enet.h)
+	int v = (int)user_io_status_get(SUN_ENET_STATUS_OPT);
+	int mode = (v == 0) ? MODE_ETH0 : (v == 1) ? MODE_OFF : v;
 	if (mode < 0 || mode > MODE_TAP) mode = MODE_OFF;
 	if (!a2065_mode_available(mode)) mode = MODE_OFF;
 	return mode;
