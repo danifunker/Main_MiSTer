@@ -25,6 +25,7 @@
 // Sun family support
 #include "support/sun/sun.h"
 #include "support/sun/sun_enet.h"
+#include "support/hp9k/hp9k.h"
 
 // Archie support
 #include "support/archie/archie.h"

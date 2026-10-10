@@ -10,6 +10,7 @@
 #include "sun.h"
 #include "sun_disk.h"
 #include "sun_cdrom.h"
+#include "../hp9k/hp9k.h"
 
 static char is_core_named(const char *n)
 {
@@ -70,6 +71,7 @@ int sun_buffered_disks()
 
 int sun_cdrom_slot()
 {
+	if (is_hp9k()) return HP9K_CD_SLOT;
 	switch (sun_model())
 	{
 	case SUN_SPARCSTATION: return 2;
