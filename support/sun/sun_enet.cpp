@@ -41,6 +41,7 @@ extern void ethernet_offload_on(const char *iface);
 #define SB_MAGIC_SS2  0x5353455448303032ULL   // SSETH002
 #define SB_MAGIC_S2   0x5332455448303031ULL   // S2ETH001
 #define SB_MAGIC_S3   0x5333455448303031ULL   // S3ETH001
+#define SB_MAGIC_HP   0x4850455448303031ULL   // HPETH001 (HP9K715)
 
 // 0 while the core is not up.
 static uint32_t rx_ring_slots(uint64_t magic)
@@ -50,7 +51,8 @@ static uint32_t rx_ring_slots(uint64_t magic)
 	case SB_MAGIC_SS1: return 8;
 	case SB_MAGIC_SS2:
 	case SB_MAGIC_S2:
-	case SB_MAGIC_S3:  return 16;
+	case SB_MAGIC_S3:
+	case SB_MAGIC_HP:  return 16;
 	default:           return 0;
 	}
 }
@@ -160,7 +162,7 @@ static void open_link(int mode)
 
 void sun_enet_start(void)
 {
-	sun_idprom_send();
+	if (is_sun_family()) sun_idprom_send();
 
 	if (!mb)
 	{

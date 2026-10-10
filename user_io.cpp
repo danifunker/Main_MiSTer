@@ -1633,7 +1633,7 @@ void user_io_init(const char *path, const char *xml)
 				// ROM load at its end and comes up with no ROM at all.
 				if (is_next()) next_enet_start();
 				// before the boot ROMs: the Sun-2's ID PROM goes in while it is held in reset
-				if (is_sun_family()) sun_enet_start();
+				if (is_sun_family() || is_hp9k()) sun_enet_start();
 
 				if (xml && isXmlName(xml) == 1)
 				{

@@ -35,6 +35,7 @@ char is_sun_family()
 
 const char *sun_net_status()
 {
+	if (is_hp9k()) return HP9K_NET_STATUS;
 	switch (sun_model())
 	{
 	case SUN_2:
