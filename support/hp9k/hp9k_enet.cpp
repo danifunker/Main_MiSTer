@@ -153,6 +153,9 @@ static void open_link(int mode)
 
 void hp9k_enet_start(void)
 {
+	// models without a LAN bridge (no OSD network bits) have no mailbox
+	if (!hp9k_net_status()) return;
+
 	if (!mb)
 	{
 		mb = (volatile uint8_t *)shmem_map(SB_BASE, SB_SIZE);

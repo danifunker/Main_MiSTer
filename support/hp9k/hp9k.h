@@ -1,4 +1,4 @@
-// HP 9000 family (HP9K715; the Series 300 later): user_io hooks, each gated on the family.
+// HP 9000 family (HP9K715, HP9K385): user_io hooks, each gated on the family.
 // Self-contained: nothing here depends on another core family's support code.
 
 #ifndef HP9K_H
@@ -12,6 +12,7 @@ enum hp9k_model_t
 {
 	HP9K_NONE,
 	HP9K_715,
+	HP9K_385,
 };
 
 hp9k_model_t hp9k_model();
