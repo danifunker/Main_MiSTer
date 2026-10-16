@@ -21,7 +21,7 @@ struct hp9k_model_info
 static const hp9k_model_info models[] =
 {
 	{ "HP9K715", HP9K_715, 3, "[14:12]" },
-	{ "HP9K385", HP9K_385, 2, 0 },          // Model 385: SCSI CD-ROM on S2, no LAN bridge yet
+	{ "HP9K385", HP9K_385, 2, "[14:12]" },
 };
 
 static const hp9k_model_info *model_info()

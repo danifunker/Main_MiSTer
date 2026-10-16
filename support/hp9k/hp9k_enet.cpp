@@ -37,6 +37,7 @@ extern void ethernet_offload_on(const char *iface);
 #define SB_TX_RING    8
 
 #define SB_MAGIC_715  0x4850455448303031ULL   // HPETH001 (HP9K715)
+#define SB_MAGIC_385  0x4833455448303031ULL   // H3ETH001 (HP9K385)
 
 // 0 while the core is not up.
 static uint32_t rx_ring_slots(uint64_t magic)
@@ -44,6 +45,7 @@ static uint32_t rx_ring_slots(uint64_t magic)
 	switch (magic)
 	{
 	case SB_MAGIC_715: return 16;
+	case SB_MAGIC_385: return 16;
 	default:           return 0;
 	}
 }
