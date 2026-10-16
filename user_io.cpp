@@ -3306,6 +3306,7 @@ void user_io_poll()
 
 	mac_poll();   // Mac SCSI family: Toolbox slot announce + deferred CD work
 	sun_poll();   // Sun SCSI family: write-buffer flushes
+	hp9k_poll();  // HP 9000 family: write-buffer flushes
 
 	if (is_minimig())
 	{

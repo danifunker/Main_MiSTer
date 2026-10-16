@@ -9,6 +9,7 @@
 #include "../../file_io.h"
 #include "hp9k.h"
 #include "hp9k_cdrom.h"
+#include "hp9k_disk.h"
 
 struct hp9k_model_info
 {
@@ -16,12 +17,13 @@ struct hp9k_model_info
 	hp9k_model_t model;
 	int          cdrom_slot;   // -1: none
 	const char  *net_status;   // 0: no LAN bridge
+	int          disk_wbuf;    // bit n: slot n is a hard disk behind the write buffer
 };
 
 static const hp9k_model_info models[] =
 {
-	{ "HP9K715", HP9K_715, 3, "[14:12]" },
-	{ "HP9K385", HP9K_385, 2, "[14:12]" },
+	{ "HP9K715", HP9K_715, 3, "[14:12]", 0x0 },   // disks on slots 0 and 2, not buffered yet
+	{ "HP9K385", HP9K_385, 2, "[14:12]", 0x3 },
 };
 
 static const hp9k_model_info *model_info()
@@ -56,9 +58,18 @@ int hp9k_cdrom_slot()
 	return m ? m->cdrom_slot : -1;
 }
 
+int hp9k_buffered_disks()
+{
+	const hp9k_model_info *m = model_info();
+	return m ? m->disk_wbuf : 0;
+}
+
 int hp9k_mount_hook(int index, const char *name, fileTYPE *f, int *writable)
 {
-	if (!is_hp9k_family() || index != hp9k_cdrom_slot()) return 1;
+	if (!is_hp9k_family()) return 1;
+
+	hp9k_disk_flush(index);
+	if (index != hp9k_cdrom_slot()) return 1;
 
 	int r = hp9k_cdrom_mount(index, name);
 	if (r == HP9K_CDROM_HANDLED)
@@ -76,13 +87,21 @@ int hp9k_mount_hook(int index, const char *name, fileTYPE *f, int *writable)
 
 void hp9k_unmount(int index)
 {
-	if (is_hp9k_family()) hp9k_cdrom_unmount(index);
+	if (!is_hp9k_family()) return;
+	hp9k_disk_flush(index);
+	hp9k_cdrom_unmount(index);
+}
+
+void hp9k_poll()
+{
+	hp9k_disk_poll();
 }
 
 int hp9k_sd_service(int disk, fileTYPE *f, int op, uint64_t lba, int sz, int ack)
 {
 	(void)f;
 	if (!op || !is_hp9k_family()) return 0;
+	if (hp9k_disk_service(disk, f, op, lba, sz, ack)) return 1;
 
 	// translated CD, or the CD-audio windows of any CD: read-only, the core ties sd_wr off
 	if (hp9k_cdrom_active(disk) || (disk == hp9k_cdrom_slot() && lba >= HP9K_CDROM_AUDIO_BLK))

@@ -24,9 +24,16 @@ const char *hp9k_net_status();
 // CD-ROM slot with image translation, or -1.
 int hp9k_cdrom_slot();
 
+// Slots behind the hard-disk write buffer (hp9k_disk.cpp), bit n = slot n.
+#define HP9K_DISK_SLOTS 4
+int hp9k_buffered_disks();
+
 // Returns 0 to fail the mount; a translated CD clears *writable and sets f->size.
 int hp9k_mount_hook(int index, const char *name, fileTYPE *f, int *writable);
 void hp9k_unmount(int index);
+
+// Write-buffer flushes; call from the user_io poll loop.
+void hp9k_poll();
 
 // 0 = not ours, 1 = serviced, -1 = ours but unsupported (caller breaks the loop).
 int hp9k_sd_service(int disk, fileTYPE *f, int op, uint64_t lba, int sz, int ack);
