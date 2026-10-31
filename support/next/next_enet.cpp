@@ -18,10 +18,17 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <linux/ethtool.h>
+#include <linux/sockios.h>
 
 #include "../../user_io.h"
 #include "../../shmem.h"
 #include "../../menu.h"
+#include "../../hardware.h"
 #include "next_enet.h"
 
 // shared host-network layer from the A2065 module
@@ -59,6 +66,16 @@ extern int  a2065_mode_available(int mode);
 
 #define MACVLAN_NAME   "next0"
 #define MAX_FRAME      1600
+#define MAX_WIRE_FRAME 1518    // longest frame that fits the guest's wire
+
+// Frames waiting for a free FPGA RX slot.  The ring is only 4 deep and a
+// TCP sender bursts a whole window (8 or more frames) back to back, so
+// dropping on a full ring loses most of every burst and TCP crawls in
+// retransmit backoff.  Queued frames older than RXQ_MAX_AGE_MS are
+// dropped instead, so a guest whose receiver is off (boot ROM self-test)
+// is never flooded with stale traffic once it arms.
+#define RXQ_LEN        64
+#define RXQ_MAX_AGE_MS 50
 
 static volatile uint8_t *mb = 0;
 static int      running = 0;      // start() called for this core
@@ -68,6 +85,26 @@ static int      made_macvlan = 0;
 static uint64_t tx_rd = 0;        // local TX ring read index
 static uint8_t  guest_mac[6];
 static int      mac_known = 0;
+
+struct rxq_frame
+{
+	unsigned long t;              // GetTimer(0) when received
+	int           len;
+	uint8_t       data[MAX_FRAME];
+};
+static rxq_frame rxq[RXQ_LEN];
+static int      rxq_head = 0;     // oldest queued frame
+static int      rxq_count = 0;
+
+// GRO (generic receive offload) makes the host NIC driver merge
+// consecutive TCP segments into one large packet before the packet socket
+// sees it.  Handed to the guest, such a "frame" is garbage: the guest
+// drops it and TCP stalls in retransmit timeouts (~1 KB/s).  GRO is turned
+// off on the interfaces the bridge reads while it is up, and the old
+// setting is put back when it closes.
+static char gro_if[2][IFNAMSIZ];
+static int  gro_was[2];
+static int  gro_n = 0;
 
 static inline uint64_t rd64(uint32_t off)
 {
@@ -87,8 +124,56 @@ static int read_guest_mac(uint8_t *out)
 	return 1;
 }
 
+// ETHTOOL_GGRO (set = 0) or ETHTOOL_SGRO; returns the value, -1 on error
+static int ethtool_gro(const char *ifname, int set, int value)
+{
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) return -1;
+	struct ethtool_value ev;
+	struct ifreq ifr;
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+	ev.cmd = set ? ETHTOOL_SGRO : ETHTOOL_GGRO;
+	ev.data = value;
+	ifr.ifr_data = (char *)&ev;
+	int r = ioctl(fd, SIOCETHTOOL, &ifr);
+	close(fd);
+	return r < 0 ? -1 : (int)ev.data;
+}
+
+static void gro_off(const char *ifname)
+{
+	if (gro_n >= 2) return;
+	int was = ethtool_gro(ifname, 0, 0);
+	if (was < 0) return;                 // no GRO control on this interface
+	if (was && ethtool_gro(ifname, 1, 0) < 0)
+	{
+		printf("[next-enet] could not turn GRO off on %s\n", ifname);
+		return;
+	}
+	strncpy(gro_if[gro_n], ifname, IFNAMSIZ - 1);
+	gro_was[gro_n++] = was;
+	if (was) printf("[next-enet] GRO off on %s\n", ifname);
+}
+
+static void gro_restore(void)
+{
+	while (gro_n > 0)
+	{
+		gro_n--;
+		if (gro_was[gro_n]) ethtool_gro(gro_if[gro_n], 1, 1);
+	}
+}
+
+static void rxq_flush(void)
+{
+	rxq_head = 0;
+	rxq_count = 0;
+}
+
 static void close_link(void)
 {
+	rxq_flush();
 	if (link_open)
 	{
 		ethernet_close();
@@ -99,6 +184,7 @@ static void close_link(void)
 		ethernet_macvlan_delete(MACVLAN_NAME);
 		made_macvlan = 0;
 	}
+	gro_restore();
 }
 
 static void open_link(int mode)
@@ -133,6 +219,10 @@ static void open_link(int mode)
 	if (!ethernet_open(iface, promisc)) return;
 	link_open = 1;
 
+	// a macvlan child receives what its parent's driver has merged
+	if (mode == NB_MODE_MACVLAN) gro_off("eth0");
+	gro_off(iface);
+
 	// flush anything the kernel queued before the link came up
 	{
 		uint8_t scratch[MAX_FRAME];
@@ -158,6 +248,7 @@ void next_enet_start(void)
 	}
 	running = 1;
 	tx_rd = 0;
+	rxq_flush();
 	mac_known = 0;
 	cur_mode = NB_MODE_OFF;
 	printf("[next-enet] armed, waiting for the core mailbox\n");
@@ -193,7 +284,8 @@ static int mode_now(uint64_t magic)
 
 void next_enet_poll(void)
 {
-	static uint8_t frame[MAX_FRAME];
+	// big enough for a merged packet, so its real length shows
+	static uint8_t frame[65536];
 
 	if (!running || !mb) return;
 	uint64_t magic = rd64(NB_MAGIC_OFF);
@@ -247,28 +339,52 @@ void next_enet_poll(void)
 		tx_rd++;
 	}
 
-	// Deliver received frames while the FPGA ring has room, and drain
-	// the socket dry every pass: a NIC whose receiver is not keeping up
-	// drops frames on the wire, it does not queue them for later.  The
-	// kernel socket buffer would otherwise hold every LAN broadcast
-	// since bridge-up and flood the guest with stale traffic the moment
-	// it arms its receiver (which broke the boot ROM's ethernet
-	// self-test on a live network).
+	// Drain the socket dry every pass so the kernel buffer never holds
+	// stale traffic (every LAN broadcast since bridge-up would otherwise
+	// flood the guest the moment it arms its receiver, which broke the
+	// boot ROM's ethernet self-test on a live network).  Frames go to a
+	// short, age-limited queue; a full queue drops the new frame, as a
+	// NIC whose receiver is not keeping up drops frames on the wire.
 	for (;;)
 	{
-		int len = ethernet_recv_nb(frame, MAX_FRAME);
+		int len = ethernet_recv_nb(frame, sizeof(frame));
 		if (len <= 0) break;
-		if (len < 14) continue;
+		if (len < 14 || len > MAX_WIRE_FRAME) continue;   // runt, or merged by the host
+		if (rxq_count == RXQ_LEN) continue;
 
-		uint64_t rxw = rd64(NB_RXWPTR_OFF);
-		uint64_t rxr = rd64(NB_RXRPTR_OFF);
-		if (rxw - rxr >= NB_RING) continue;   // ring full: drop, keep draining
+		rxq_frame *q = &rxq[(rxq_head + rxq_count) % RXQ_LEN];
+		q->t = GetTimer(0);
+		q->len = len;
+		memcpy(q->data, frame, len);
+		rxq_count++;
+	}
+
+	// Deliver queued frames while the FPGA ring has room
+	uint64_t rxw = rd64(NB_RXWPTR_OFF);
+	uint64_t rxr = rd64(NB_RXRPTR_OFF);
+	unsigned long now = GetTimer(0);
+	while (rxq_count)
+	{
+		rxq_frame *q = &rxq[rxq_head];
+		if (now - q->t > RXQ_MAX_AGE_MS)
+		{
+			rxq_head = (rxq_head + 1) % RXQ_LEN;
+			rxq_count--;
+			continue;
+		}
+		if (rxw - rxr >= NB_RING)
+		{
+			rxr = rd64(NB_RXRPTR_OFF);
+			if (rxw - rxr >= NB_RING) break;   // ring full: keep the rest queued
+		}
 
 		uint32_t slot = NB_RXSLOT_OFF + NB_SLOT_SIZE * (uint32_t)(rxw & (NB_RING - 1));
-		memcpy((void *)(mb + slot + 8), frame, len);
+		memcpy((void *)(mb + slot + 8), q->data, q->len);
 		__sync_synchronize();
-		wr64(slot, (uint64_t)len);
+		wr64(slot, (uint64_t)q->len);
 		__sync_synchronize();
-		wr64(NB_RXWPTR_OFF, rxw + 1);
+		wr64(NB_RXWPTR_OFF, ++rxw);
+		rxq_head = (rxq_head + 1) % RXQ_LEN;
+		rxq_count--;
 	}
 }
