@@ -33,6 +33,8 @@
 #include "support/ibmrs6k/ibmrs6k_enet.h"
 #include "support/sgi/sgi.h"
 #include "support/sgi/sgi_enet.h"
+// DEC AlphaStation 200 support
+#include "support/decalpha/decalpha.h"
 
 // Archie support
 #include "support/archie/archie.h"

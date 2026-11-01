@@ -2326,6 +2326,8 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 				if (ret) ret = hp9k_mount_hook(index, name, &sd_image[index], &writable);
 				if (ret) ret = ibmrs6k_mount_hook(index, name, &sd_image[index], &writable);
 				if (ret) ret = sgi_mount_hook(index, name, &sd_image[index], &writable);
+				// DEC AlphaStation 200: CD slot translation, disk write buffer (support/decalpha)
+				if (ret) ret = decalpha_mount_hook(index, name, &sd_image[index], &writable);
 			if (ret) ret = next_mount_hook(index, name, &sd_image[index], &writable);
 				if (ret) ret = a3_mount_hook(index, name, &sd_image[index], &writable);
 
@@ -2354,6 +2356,7 @@ int user_io_file_mount(const char *name, unsigned char index, char pre, int pre_
 		hp9k_unmount(index);
 		ibmrs6k_unmount(index);
 		sgi_unmount(index);
+		decalpha_unmount(index);
 		next_unmount(index);
 		a3_unmount(index);
 		falcon_scsi_unmount(index);
@@ -3366,6 +3369,7 @@ void user_io_poll()
 	hp9k_poll();
 	ibmrs6k_poll();
 	sgi_poll();
+	decalpha_poll();   // DEC AlphaStation 200: write-buffer flushes
 
 	if (is_minimig())
 	{
@@ -3569,6 +3573,11 @@ void user_io_poll()
 			else if (int sgop = sgi_sd_service(disk, &sd_image[disk], op, lba, sz, ack))
 			{
 				if (sgop < 0) break;
+			}
+			else if (int daop = decalpha_sd_service(disk, &sd_image[disk], op, lba, sz, ack))
+			{
+				// DEC AlphaStation 200 disk write buffer and CD slot (support/decalpha); SPI is done by the hook.
+				if (daop < 0) break;
 			}
 			else if (int mop = marty_sd_service(disk, op, (uint32_t)lba, sz, ack))
 			{
