@@ -35,6 +35,7 @@
 #include "support/sgi/sgi_enet.h"
 // DEC AlphaStation 200 support
 #include "support/decalpha/decalpha.h"
+#include "support/decalpha/decalpha_enet.h"
 
 // Archie support
 #include "support/archie/archie.h"

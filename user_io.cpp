@@ -1495,6 +1495,7 @@ void user_io_init(const char *path, const char *xml)
 	hp9k_enet_stop();
 	ibmrs6k_enet_stop();
 	sgi_enet_stop();
+	decalpha_enet_stop();
 
 	// we need to set the directory to where the XML file (MRA) is
 	// not the RBF. The RBF will be in arcade, which the user shouldn't
@@ -1651,6 +1652,7 @@ void user_io_init(const char *path, const char *xml)
 				if (is_hp9k_family()) hp9k_enet_start();
 				if (is_ibmrs6k()) ibmrs6k_enet_start();
 				if (is_sgi_family()) sgi_enet_start();
+				if (is_decalpha()) decalpha_enet_start();
 
 				if (xml && isXmlName(xml) == 1)
 				{
@@ -3416,6 +3418,7 @@ void user_io_poll()
 	hp9k_enet_poll();
 	ibmrs6k_enet_poll();
 	sgi_enet_poll();
+	decalpha_enet_poll();
 
 	// The NeXT keeps a battery backed clock that the guest reads at
 	// boot; the one-shot update at core load is not enough if the core
