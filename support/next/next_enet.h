@@ -14,10 +14,15 @@
 // Minimig A2065 module (support/minimig/minimig_a2065_ethernet.cpp);
 // only one core runs at a time, so sharing is safe.
 //
-// Interface selection mirrors the A2065 modes and lives in core
-// status bits [54:52] (the "Network" option in the core's OSD):
+// Interface selection mirrors the A2065 modes:
 //   0 Off, 1 eth0 (shared, BPF filtered), 2 eth1 (dedicated),
 //   3 macvlan child of eth0, 4 tap0.
+// A core whose mailbox magic is "NXTETH02" (NeXT-Color with the MiSTer
+// OSD standard's menu) publishes the mode in the mailbox's NET_MODE word,
+// written at each core reset, so the setting waits for "Apply and reset"
+// and the core maps its own OSD order.  A core with "NXTETH01" (the mono
+// NeXT core, older NeXT-Color builds) keeps it in status bits [54:52]
+// (the "Network" option in its OSD).
 
 #define NEXT_ENET_STATUS_OPT "[54:52]"
 
