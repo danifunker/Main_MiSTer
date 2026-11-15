@@ -3,11 +3,15 @@
 // DDR3 mailbox layout (ARM physical 0x1FF00000, the same window the
 // A2065 uses; the cores are mutually exclusive).  All slots are 64-bit
 // little-endian words; frame byte i sits at slot byte 8+i:
-//   +0x0000  MAGIC     0x4E58544554483031 ("NXTETH01"), FPGA-written
+//   +0x0000  MAGIC     0x4E58544554483031 ("NXTETH01") or
+//                      0x4E58544554483032 ("NXTETH02"), FPGA-written last
 //   +0x0008  TX_WPTR   FPGA increments per transmitted frame
 //   +0x0010  RX_WPTR   this daemon increments per delivered frame
 //   +0x0018  RX_RPTR   FPGA increments per consumed frame
 //   +0x0020  GUEST_MAC bit63 valid, bits[47:0] station address
+//   +0x0028  NET_MODE  NXTETH02 only: bit63 valid, bits[2:0] the NB_MODE_
+//                      to open, the core's OSD choice as latched at its
+//                      last reset (NXTETH01: the mode is in status[54:52])
 //   +0x0800  TX slots: 4 x 2048 bytes (u64 len header, then frame)
 //   +0x2800  RX slots: 4 x 2048 bytes
 
@@ -38,12 +42,14 @@ extern int  a2065_mode_available(int mode);
 #define NB_RXWPTR_OFF  0x0010
 #define NB_RXRPTR_OFF  0x0018
 #define NB_MAC_OFF     0x0020
+#define NB_NETMODE_OFF 0x0028
 #define NB_TXSLOT_OFF  0x0800
 #define NB_RXSLOT_OFF  0x2800
 #define NB_SLOT_SIZE   0x800
 #define NB_RING        4
 
-#define NB_MAGIC       0x4E58544554483031ULL
+#define NB_MAGIC       0x4E58544554483031ULL   // "NXTETH01": mode in status[54:52]
+#define NB_MAGIC2      0x4E58544554483032ULL   // "NXTETH02": mode in NET_MODE
 
 #define NB_MODE_OFF     0
 #define NB_MODE_ETH0    1
@@ -165,9 +171,21 @@ void next_enet_stop(void)
 	printf("[next-enet] stopped\n");
 }
 
-static int mode_from_status(void)
+// The mode to run: NXTETH02 cores publish it in the mailbox (so it changes
+// only at the core's reset, like its other settings); NXTETH01 cores (the
+// mono NeXT core, older NeXT-Color builds) keep it in status[54:52].
+static int mode_now(uint64_t magic)
 {
-	int mode = (int)user_io_status_get(NEXT_ENET_STATUS_OPT);
+	int mode;
+	if (magic == NB_MAGIC2)
+	{
+		uint64_t v = rd64(NB_NETMODE_OFF);
+		mode = (v >> 63) ? (int)(v & 7) : NB_MODE_OFF;
+	}
+	else
+	{
+		mode = (int)user_io_status_get(NEXT_ENET_STATUS_OPT);
+	}
 	if (mode < 0 || mode > NB_MODE_TAP) mode = NB_MODE_OFF;
 	if (!a2065_mode_available(mode)) mode = NB_MODE_OFF;
 	return mode;
@@ -178,7 +196,8 @@ void next_enet_poll(void)
 	static uint8_t frame[MAX_FRAME];
 
 	if (!running || !mb) return;
-	if (rd64(NB_MAGIC_OFF) != NB_MAGIC) return;   // core not up yet
+	uint64_t magic = rd64(NB_MAGIC_OFF);
+	if (magic != NB_MAGIC && magic != NB_MAGIC2) return;   // core not up yet
 
 	// track the guest MAC published by the FPGA
 	uint8_t m[6];
@@ -193,7 +212,7 @@ void next_enet_poll(void)
 	}
 
 	// follow the OSD selection
-	int mode = mode_from_status();
+	int mode = mode_now(magic);
 	if (mode != cur_mode)
 	{
 		cur_mode = mode;
